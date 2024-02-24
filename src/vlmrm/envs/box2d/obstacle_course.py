@@ -50,8 +50,8 @@ SCALE = 2.0  # Track scale
 TRACK_RAD = 900 / SCALE  # Track is heavily morphed circle with this radius
 PLAYFIELD = 4000 / SCALE  # Game over boundary
 FPS = 50  # Frames per second
-ZOOM = 10  # 2.7  # Camera zoom
-ZOOM_FOLLOW = False  # Set to False for fixed view (don't use zoom)
+ZOOM = 10 # 2.7  # Camera zoom
+ZOOM_FOLLOW = True  # Set to False for fixed view (don't use zoom)
 
 
 # TODO: remove when maze generation is implemented
@@ -117,6 +117,14 @@ class FrictionDetector(contactListener):
                     self.env.new_lap = True
         else:
             obj.tiles.remove(tile)
+
+
+def rgb_to_shell_code(rgb):
+    """Convert an RGB tuple to a shell color code. If rgb is None, reset the color to default."""
+    if rgb is None:
+        return "\033[0m"
+    r, g, b = rgb
+    return f"\033[38;2;{r};{g};{b}m"
 
 
 class Cell:
@@ -690,6 +698,7 @@ class ObstacleCourse(gym.Env, EzPickle):
     metadata = {
         "render_modes": [
             "human",
+            "shell_state_pixels",
             "rgb_array",
             "state_pixels",
         ],
@@ -954,9 +963,9 @@ class ObstacleCourse(gym.Env, EzPickle):
         assert self.car is not None
         # computing transformations
         if ZOOM_FOLLOW:
-            angle = -self.car.hull.angle
+            angle = 0  # -self.car.hull.angle
             # Animating first second zoom.
-            zoom = 0.1 * SCALE * max(1 - self.t, 0) + ZOOM * SCALE * min(self.t, 1)
+            zoom = 0.1 * SCALE * max(1 - self.t, 0) + 0.5 * ZOOM * SCALE * min(self.t, 1)
             scroll_x = -(self.car.hull.position[0]) * zoom
             scroll_y = -(self.car.hull.position[1]) * zoom
         else:
@@ -996,6 +1005,30 @@ class ObstacleCourse(gym.Env, EzPickle):
             self.screen.fill(0)
             self.screen.blit(self.surf, (0, 0))
             pygame.display.flip()
+        elif mode == "shell_state_pixels":
+            line_len = 120
+            full_block = "█"
+
+            img = self._create_image_array(self.surf, (STATE_W, STATE_H))
+            scaledown = 1 << (int(img.shape[0] / line_len) - 1).bit_length()
+            img_pool = np.array(
+                [
+                    [
+                        [int(np.mean(img[i : i + scaledown, j : j + scaledown, k])) for k in range(0, img.shape[2])]
+                        for j in range(0, img.shape[1], scaledown)
+                    ]
+                    for i in range(0, img.shape[0], scaledown)
+                ]
+            )
+            # use rgb_to_shell_code to convert each triple of rgb values in img_pool to a shell code
+            shell_codes = "\n".join([
+                "".join([f"{rgb_to_shell_code(img_pool[i, j])}{full_block}"
+                        for j in range(0, img_pool.shape[1])])
+                    for i in range(0, img_pool.shape[0])]) + rgb_to_shell_code(None)
+            print("scaledown:", scaledown)
+            print(shell_codes)
+            return img
+
         elif mode == "rgb_array":
             return self._create_image_array(self.surf, (VIDEO_W, VIDEO_H))
         elif mode == "state_pixels":
@@ -1145,37 +1178,57 @@ class ObstacleCourse(gym.Env, EzPickle):
 if __name__ == "__main__":
     a = np.array([0.0, 0.0, 0.0])
 
-    def register_input():
+    def register_input(render_mode="human"):
         global quit, restart
-        for event in pygame.event.get():
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_LEFT:
-                    a[0] = -1.0
-                if event.key == pygame.K_RIGHT:
-                    a[0] = +1.0
-                if event.key == pygame.K_UP:
-                    a[1] = +1.0
-                if event.key == pygame.K_DOWN:
-                    a[2] = +0.8  # set 1.0 for wheels to block to zero rotation
-                if event.key == pygame.K_RETURN:
-                    restart = True
-                if event.key == pygame.K_ESCAPE:
+        if render_mode == "human":
+            for event in pygame.event.get():
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_LEFT:
+                        a[0] = -1.0
+                    if event.key == pygame.K_RIGHT:
+                        a[0] = +1.0
+                    if event.key == pygame.K_UP:
+                        a[1] = +1.0
+                    if event.key == pygame.K_DOWN:
+                        a[2] = +0.8  # set 1.0 for wheels to block to zero rotation
+                    if event.key == pygame.K_RETURN:
+                        restart = True
+                    if event.key == pygame.K_ESCAPE:
+                        quit = True
+                if event.type == pygame.KEYUP:
+                    if event.key == pygame.K_LEFT:
+                        a[0] = 0
+                    if event.key == pygame.K_RIGHT:
+                        a[0] = 0
+                    if event.key == pygame.K_UP:
+                        a[1] = 0
+                    if event.key == pygame.K_DOWN:
+                        a[2] = 0
+                if event.type == pygame.QUIT:
                     quit = True
-
-            if event.type == pygame.KEYUP:
-                if event.key == pygame.K_LEFT:
-                    a[0] = 0
-                if event.key == pygame.K_RIGHT:
-                    a[0] = 0
-                if event.key == pygame.K_UP:
-                    a[1] = 0
-                if event.key == pygame.K_DOWN:
-                    a[2] = 0
-
-            if event.type == pygame.QUIT:
+        elif render_mode == "shell_state_pixels":
+            # take wasd input
+            input_str = input(">")
+            if input_str == "w":
+                a[1] = +1.0
+            elif input_str == "a":
+                a[0] = -1.0
+            elif input_str == "s":
+                a[2] = +0.8
+            elif input_str == "d":
+                a[0] = +1.0
+            elif input_str == "r":
+                restart = True
+            elif input_str == "q":
                 quit = True
+            elif input_str == " ":
+                a[0] = 0
+                a[1] = 0
+                a[2] = 0
+        else:
+            raise ValueError(f"Invalid render_mode: {render_mode} (must be 'human' or 'shell_state_pixels')")
 
-    env = ObstacleCourse(render_mode="human")
+    env = ObstacleCourse(render_mode="shell_state_pixels")  # "human")
 
     quit = False
     while not quit:
@@ -1184,7 +1237,9 @@ if __name__ == "__main__":
         steps = 0
         restart = False
         while True:
-            register_input()
+            register_input(env.render_mode)
+            if env.render_mode == "shell_state_pixels":
+                 env.render()
             s, r, terminated, truncated, info = env.step(a)
             total_reward += r
             if steps % 200 == 0 or terminated or truncated:
