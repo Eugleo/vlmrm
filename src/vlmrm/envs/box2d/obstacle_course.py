@@ -43,18 +43,17 @@ MAZE_BAD_PATHS = 5  # number of walls to secretly delete
 EDGE_LEN = 2  # how long each edge is after rendering (in tiles)
 
 FLOWER_COLOR = (255, 0, 255)
-FRICTION_LIMIT_GRASS = FRICTION_LIMIT * 0.001  # originally FRICTION_LIMIT * 0.6
-
+FRICTION_LIMIT_GRASS = FRICTION_LIMIT * 0.6
+GRASS_DRAG = 100
 
 SCALE = 2.0  # Track scale
-TRACK_RAD = 900 / SCALE  # Track is heavily morphed circle with this radius
-PLAYFIELD = 4000 / SCALE  # Game over boundary
+PLAYFIELD = 50 * max(MAZE_W, MAZE_H) / SCALE # 4000 / SCALE  # Game over boundary
 FPS = 50  # Frames per second
 ZOOM = 10 # 2.7  # Camera zoom
 ZOOM_FOLLOW = True  # Set to False for fixed view (don't use zoom)
 
 
-# TODO: remove when maze generation is implemented
+
 TRACK_WIDTH = 40 / SCALE
 GRASS_DIM = PLAYFIELD / 20.0
 TRACK_DETAIL_STEP = 21 / SCALE
@@ -461,6 +460,8 @@ class Car(GymCar):
             )
             self.fuel_spent += dt * ENGINE_POWER * w.gas
 
+
+
             if w.brake >= 0.9:
                 w.omega = 0
             elif w.brake > 0:
@@ -470,6 +471,13 @@ class Car(GymCar):
                 if abs(val) > abs(w.omega):
                     val = abs(w.omega)  # low speed => same as = 0
                 w.omega += dir * val
+
+            # here we want it to be very disfavorable to cross the grass
+            if grass:
+                dir = -np.sign(w.omega)
+                val = min(abs(w.omega), abs(GRASS_DRAG))
+                w.omega += dir * GRASS_DRAG
+
             w.phase += w.omega * dt
 
             vr = w.omega * w.wheel_rad  # rotating wheel speed
@@ -824,7 +832,7 @@ class ObstacleCourse(gym.Env, EzPickle):
             for d in idxs:
                 dx = d if edge.direction == "E" else 0
                 dy = d if edge.direction == "N" else 0
-                result.add((edge.x * EDGE_LEN + dx, edge.y * EDGE_LEN + dy))
+                result.add((edge.x * EDGE_LEN + dx - GRASS_DIM * 3/4, edge.y * EDGE_LEN + dy - GRASS_DIM * 3/4))
         return list(result)
 
     def _roadpiece_to_poly(self, roadpiece, is_secret):
@@ -972,7 +980,7 @@ class ObstacleCourse(gym.Env, EzPickle):
             angle = 0
             zoom = ZOOM * SCALE * 0.1
             # center the x coordinate on the middle of the maze
-            scroll_x = -MAZE_W * TRACK_WIDTH / 2 * 2 * zoom
+            scroll_x = - MAZE_W * TRACK_WIDTH / 2 * 2 * zoom
             scroll_y = 0
 
         trans = pygame.math.Vector2((scroll_x, scroll_y)).rotate_rad(angle)
@@ -1174,12 +1182,32 @@ class ObstacleCourse(gym.Env, EzPickle):
             self.isopen = False
             pygame.quit()
 
+def parse_qsteps(stepstr):
+    """Parse a string of 'wasd ' steps formatted like '10wd5a2 2s' into a list of steps"""
+    stepl = list(stepstr)[::-1]
+    steps = []
+    while stepl:
+        num = ""
+        while stepl and stepl[-1].isdigit():
+            num += stepl.pop()
+        if num == "":
+            num = "0"
+        if not stepl:  # ends in a number with no following step
+            return steps
+        st = ""
+        while stepl and not stepl[-1].isdigit():
+            st += stepl.pop()
+        steps.extend([st] * int(num))
+    return steps
+
 
 if __name__ == "__main__":
     a = np.array([0.0, 0.0, 0.0])
 
     def register_input(render_mode="human"):
         global quit, restart
+        if render_mode == "shell_state_pixels":
+            global qsteps
         if render_mode == "human":
             for event in pygame.event.get():
                 if event.type == pygame.KEYDOWN:
@@ -1207,28 +1235,42 @@ if __name__ == "__main__":
                 if event.type == pygame.QUIT:
                     quit = True
         elif render_mode == "shell_state_pixels":
-            # take wasd input
-            input_str = input(">")
-            if input_str == "w":
+            if qsteps:
+                input_str = qsteps.pop(0)
+            else:
+                # take wasd input
+                qsteps.extend(parse_qsteps(input(">")))
+                if qsteps:
+                    input_str = qsteps.pop(0)
+                else:
+                    input_str = ""
+            if "w" in input_str:
                 a[1] = +1.0
-            elif input_str == "a":
-                a[0] = -1.0
-            elif input_str == "s":
-                a[2] = +0.8
-            elif input_str == "d":
-                a[0] = +1.0
-            elif input_str == "r":
-                restart = True
-            elif input_str == "q":
-                quit = True
-            elif input_str == " ":
-                a[0] = 0
+            else:
                 a[1] = 0
+            if "a" in input_str:
+                a[0] = -1.0
+            else:
+                a[0] = 0
+            if "s" in input_str:
+                a[2] = +0.8
+            else:
                 a[2] = 0
+            if "d" in input_str:
+                a[0] = +1.0
+            else:
+                a[0] = 0
+            if "r" in input_str:
+                restart = True
+            if "q" in input_str:
+                quit = True
         else:
             raise ValueError(f"Invalid render_mode: {render_mode} (must be 'human' or 'shell_state_pixels')")
 
     env = ObstacleCourse(render_mode="shell_state_pixels")  # "human")
+
+    if env.render_mode == "shell_state_pixels":
+        qsteps = []
 
     quit = False
     while not quit:
@@ -1238,7 +1280,7 @@ if __name__ == "__main__":
         restart = False
         while True:
             register_input(env.render_mode)
-            if env.render_mode == "shell_state_pixels":
+            if env.render_mode == "shell_state_pixels" and not qsteps:
                  env.render()
             s, r, terminated, truncated, info = env.step(a)
             total_reward += r
