@@ -4,6 +4,7 @@ import itertools
 import math
 import random
 from typing import Literal, Optional, Tuple, Union
+import os
 
 import gymnasium as gym
 import numpy as np
@@ -1070,10 +1071,29 @@ class ObstacleCourse(gym.Env, EzPickle):
                         (GRASS_DIM * x + GRASS_DIM, GRASS_DIM * y + GRASS_DIM),
                     ]
                 )
+
+        grass_texture = pygame.image.load(
+            os.path.join(os.path.dirname(__file__), "grass.jpg")
+        )
+        # grass_texture = pygame.transform.scale(
+        #     grass_texture, (int(2 * bounds * zoom), int(2 * bounds * zoom))
+        # )
+        # self.surf.blit(grass_texture, (2.4*bounds, 0.9*bounds))
+
+
         for poly in grass:
-            self._draw_colored_polygon(
-                self.surf, poly, self.grass_color, zoom, translation, angle
+            poly = [(p[0], p[1]) for p in poly]
+            assert len(poly) == 4
+            poly_width = abs(poly[0][0] - poly[1][0])
+            poly_height = abs(poly[0][1] - poly[3][1])
+            grass_texture = pygame.transform.scale(
+                grass_texture, (2*int(poly_width * zoom), 2*int(poly_height * zoom))
             )
+            self.surf.blit(grass_texture, (poly[0][0] * zoom + translation[0], poly[0][1] * zoom + translation[1]))
+
+            #self._draw_colored_polygon(
+            #   self.surf, poly, self.grass_color, zoom, translation, angle
+            #)
 
         # draw road
         for poly, color in self.road_poly:
