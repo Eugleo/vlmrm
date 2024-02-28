@@ -875,7 +875,7 @@ class ObstacleCourse(gym.Env, EzPickle):
         return self.step(None)[0], {}
 
     def step(
-        self, action: Union[np.ndarray, int]
+        self, action: Union[np.ndarray, int], camera=None
     ) -> Tuple[np.ndarray, float, bool, dict]:
         assert self.car is not None
         if action is not None:
@@ -920,10 +920,10 @@ class ObstacleCourse(gym.Env, EzPickle):
                 step_reward = -100
 
         if self.render_mode == "human":
-            self.render()
+            self.render(camera)
         return self.state, step_reward, terminated, truncated, {}
 
-    def render(self):
+    def render(self, camera=None):
         if self.render_mode is None:
             assert self.spec is not None
             gym.logger.warn(
@@ -933,9 +933,9 @@ class ObstacleCourse(gym.Env, EzPickle):
             )
             return
         else:
-            return self._render(self.render_mode)
+            return self._render(self.render_mode, camera)
 
-    def _render(self, mode: str):
+    def _render(self, mode: str, camera=None):
         assert mode in self.metadata["render_modes"]
 
         pygame.font.init()
@@ -963,8 +963,11 @@ class ObstacleCourse(gym.Env, EzPickle):
             angle = 0
             zoom = ZOOM * SCALE * 0.1
             # center the x coordinate on the middle of the maze
-            scroll_x = -MAZE_W * TRACK_WIDTH / 2 * 2 * zoom
-            scroll_y = 0
+            if camera is None:
+                scroll_x = -MAZE_W * TRACK_WIDTH / 2 * 2 * zoom
+                scroll_y = 0
+            else:
+                scroll_x, scroll_y = camera
 
         trans = pygame.math.Vector2((scroll_x, scroll_y)).rotate_rad(angle)
         trans = (WINDOW_W / 2 + trans[0], WINDOW_H / 4 + trans[1])
@@ -1161,6 +1164,14 @@ if __name__ == "__main__":
                     restart = True
                 if event.key == pygame.K_ESCAPE:
                     quit = True
+                if event.key == pygame.K_w:
+                    camera = (camera[0], camera[1] - 100)
+                if event.key == pygame.K_s:
+                    camera = (camera[0], camera[1] + 100)
+                if event.key == pygame.K_a:
+                    camera = (camera[0] + 100, camera[1])
+                if event.key == pygame.K_d:
+                    camera = (camera[0] - 100, camera[1])
 
             if event.type == pygame.KEYUP:
                 if event.key == pygame.K_LEFT:
@@ -1185,7 +1196,7 @@ if __name__ == "__main__":
         restart = False
         while True:
             register_input()
-            s, r, terminated, truncated, info = env.step(a)
+            s, r, terminated, truncated, info = env.step(a, camera)
             total_reward += r
             if steps % 200 == 0 or terminated or truncated:
                 print("\naction " + str([f"{x:+0.2f}" for x in a]))
