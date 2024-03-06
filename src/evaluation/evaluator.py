@@ -69,6 +69,22 @@ def parse_args():
         default=False,
         action="store_true",
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--average-by-video",
+        action="store_true",
+        help="Use several videos of same action and average similarity"
+    )
+    parser.add_argument(
+        "--max-n-videos",
+        type=int,
+        default=10,
+        help="Max number of videos taken from each directory when `--average-by-video` is True"
+    )
     parser.add_argument("--cache-dir", default=".cache")
 
     args = parser.parse_args()
@@ -118,7 +134,7 @@ def subsample(x: torch.Tensor, frames: int) -> torch.Tensor:
     return x
 
 
-def load_video(path: str, n_frames=5):
+def gpt4v_load_video(path: str, n_frames=5):
     video = cv2.VideoCapture(path)
 
     b64_frames = []
@@ -164,7 +180,7 @@ The car has moved through the roundabout and took the second exit.
     """
 
     # Subsample the frames from the videos
-    videos = [load_video(p) for p in video_paths]
+    videos = [gpt4v_load_video(p) for p in video_paths]
 
     matrix = np.zeros((len(videos), len(descriptions)))
 
@@ -247,11 +263,22 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     data = pd.read_csv(args.table_path)
-    video_paths = data["path"].to_list()
-    video_names = [Path(p).stem for p in video_paths]
-    videos = util.get_video_batch(video_paths, device)
     descriptions = data["label"].to_list()
 
+# Getting videos
+    video_paths = []
+    video_group_borders = [0]
+
+    for dir_path in data["path"].values:
+        # Sorted to ensure deterministic results
+        video_paths_group = sorted(list(Path(dir_path).glob("*.avi")))
+        video_paths.extend(video_paths_group[:args.max_n_videos] if args.average_by_video else video_paths_group[:1])
+        video_group_borders.append(len(video_paths))
+
+    videos = util.get_video_batch(video_paths, device)
+    video_group_names = [Path(p).stem for p in data["path"]]
+
+# Choosing model
     if args.model.lower() == "gpt4":
         reward_matrix = gpt4(video_paths, descriptions)
         title = f"gpt4_{args.experiment_id}"
@@ -283,10 +310,11 @@ def main():
         )
     encoder = encoder.to(device)
 
-    rewards = []
+# Parsing which reward functions we should try
+    named_reward_functions = []
     for reward_name in args.rewards.split(","):
         if reward_name == "logit":
-            rewards.append((logit_reward, f"{args.model}_logit_{args.experiment_id}"))
+            named_reward_functions.append((logit_reward, f"{args.model}_logit_{args.experiment_id}"))
         elif reward_name == "projection":
             baselines = encoder.encode_text(data["baseline"].to_list())
             if args.alphas is None:
@@ -294,22 +322,52 @@ def main():
             for alpha in args.alphas.split(","):
                 reward_fun = mk_projection_reward(float(alpha), baselines)
                 title = f"{args.model}_projection_{alpha}_{args.experiment_id}"
-                rewards.append((reward_fun, title))
+                named_reward_functions.append((reward_fun, title))
 
-    for reward_fun, title in rewards:
+# Running evaluations
+    for i, (reward_fun, title) in enumerate(named_reward_functions):
+        if args.verbose:
+            print(f"({i + 1}/{len(named_reward_functions)})   Evaluating {title}")
+
         reward_matrix = evaluate(encoder, videos, descriptions, reward_fun)
-        if args.standardize:
-            reward_matrix = (
-                reward_matrix - reward_matrix.mean(dim=0, keepdim=True)
-            ) / (reward_matrix.std(dim=0, keepdim=True) + 1e-6)
+
+        average_similarities, std_similarities = util.aggregate_similarities_many_video_groups(
+            reward_matrix,
+            prompt_group_borders=range(len(descriptions) + 1),
+            video_group_borders=video_group_borders,
+            do_normalize=args.standardize,
+        )
+
+        sub_dir = Path(args.output_dir) / title
+        sub_dir.mkdir(parents=True, exist_ok=True)
+
         util.make_heatmap(
-            reward_matrix.cpu().numpy(),
+            average_similarities,
             groups=data["group"].to_list(),
-            trajectories_names=video_names,
+            trajectories_names=video_group_names,
             labels=descriptions,
-            result_dir=args.output_dir,
+            result_dir=str(sub_dir),
             experiment_id=title,
         )
+
+        identity = np.eye(len(descriptions))
+        # Need to treat broadcasting carefully here
+        binary_matrix = np.where(np.isclose(average_similarities, average_similarities.max(axis=1, keepdims=True)), 1, 0)
+
+        cosine_similarity = (binary_matrix * identity / np.sqrt(len(descriptions) * binary_matrix.sum())).sum()
+        l2_distance = np.sqrt(np.sum(np.square((identity - binary_matrix)))) / len(descriptions)
+        l1_distance = np.sum(np.abs(identity - binary_matrix)) / len(descriptions)
+
+        # If we predict constant label for all videos, cosine similarity will be equal to 1/len(descriptions), since only one guess will be correct
+        metrics = {
+            "constant_baseline_cosine_similarity": 1 / len(descriptions),
+            "cosine_similarity": cosine_similarity,
+            "l2_distance": l2_distance,
+            "l1_distance": l1_distance,
+        }
+
+        with open(sub_dir / "metrics.json", "w") as f:
+            json.dump(metrics, f, indent=2)
 
 
 if __name__ == "__main__":
