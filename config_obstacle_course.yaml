@@ -27,7 +27,7 @@ reward:
 rl:
   policy_name: MlpPolicy
   n_steps: 100000 # Total number of simulation steps to be collected.
-  n_envs_per_worker: 4 # TODO: revert when running on more GPUs # 2 # Number of environments per worker (GPU)
+  n_envs_per_worker: 8 # 4 # TODO: revert when running on more GPUs # 2 # Number of environments per worker (GPU)
   episode_length: 200 # Desired episode length
   learning_starts: 100 # Number of env steps to collect before training
   train_freq: 200 # Number of collected env steps between training iterations
