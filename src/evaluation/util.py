@@ -1,5 +1,5 @@
 import os
-from typing import List, Union, Tuple
+from typing import List, Union, Tuple, Callable
 
 from pathlib import Path
 import imageio.v3 as iio
@@ -7,8 +7,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
 import torch
+from torch import Tensor
+from einops import rearrange
 from matplotlib.patches import Circle, Rectangle
 
+from vlmrm.reward.encoders import Encoder
+import vlmrm.reward.rewards as rewards
 
 def load_video(path: str):
     if path.endswith(".mp4"):
@@ -130,3 +134,46 @@ def aggregate_similarities_many_video_groups(similarities: np.ndarray, prompt_gr
             std_similarities[video_group_idx, prompt_group_idx] = similarities[v_start:v_end, p_start:p_end].std()
 
     return average_similarities, std_similarities
+
+
+def evaluate(
+    encoder: Encoder,
+    videos: List[Tensor],
+    descriptions: List[str],
+    reward: Callable[[Tensor, Tensor], Tensor],
+):
+    subsampled_videos = torch.stack([encoder.subsample(video) for video in videos])
+    # The encoder expects the input to be (frames, windows, episodes, c h w)
+    subsampled_videos = rearrange(subsampled_videos, "b f c h w -> f 1 b c h w")
+    # (f w e c h w) -> (w e d)
+    video_encodings = encoder.encode_video(subsampled_videos)
+    video_encodings = rearrange(video_encodings, "1 b d -> b d")
+
+    description_encodings = encoder.encode_text(descriptions)
+    description_encodings.to(video_encodings.device)
+
+    return reward(video_encodings, description_encodings)
+
+
+def logit_reward(video_encodings: Tensor, description_encodings: Tensor):
+    return rewards.logit_reward(
+        video_encodings, description_encodings, torch.arange(len(description_encodings))
+    )
+
+
+def mk_projection_reward(alpha: float, baselines: Tensor):
+    def reward(video_encodings: Tensor, description_encodings: Tensor) -> Tensor:
+        reward_cols = [
+            rewards.projection_reward(video_encodings, b, t.unsqueeze(0), alpha)
+            for t, b in zip(description_encodings, baselines)
+        ]
+        return torch.stack(reward_cols, dim=1)
+
+    return reward
+
+
+def subsample(x: torch.Tensor, frames: int) -> torch.Tensor:
+    n_frames, *_ = x.shape
+    step = n_frames // frames
+    x = x[::step, ...][:frames, ...]
+    return x

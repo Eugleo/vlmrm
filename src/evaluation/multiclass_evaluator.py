@@ -19,7 +19,7 @@ from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_sco
 from evaluation import util
 import vlmrm.reward.rewards as rewards
 from vlmrm.reward.encoders import CLIP, S3D, Encoder, ViCLIP
-from evaluation.evaluator import evaluate, logit_reward, mk_projection_reward, subsample, gpt4v_load_video, gpt4
+from evaluation.evaluator import gpt4v_load_video, gpt4
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -99,8 +99,8 @@ def parse_args():
     return args
 
 def get_descriptions_and_baselines_for_tasks(label_descriptions: pd.DataFrame) -> Tuple[Dict[str, Dict[int, str]], Dict[str, str]]:
-    name2label2description = {}
-    name2baseline = {}
+    name2label2description: Dict[str, Dict[int, str]] = {}
+    name2baseline: Dict[str, str] = {}
 
     for task_name, label_id, baseline_prompt, label_prompt in label_descriptions.itertuples(index=False):
         if task_name not in name2label2description:
@@ -114,25 +114,6 @@ def get_descriptions_and_baselines_for_tasks(label_descriptions: pd.DataFrame) -
 
     return name2label2description, name2baseline
 
-def compute_all_vs_all_metrics(average_similarities: torch.Tensor) -> Dict[str, float]:
-    n_video_groups, n_descriptions = average_similarities.shape
-
-    identity = np.eye(n_descriptions)
-    # Need to treat broadcasting carefully here
-    binary_matrix = np.where(np.isclose(average_similarities, average_similarities.max(axis=1, keepdims=True)), 1, 0)
-
-    cosine_similarity = (binary_matrix * identity / np.sqrt(n_descriptions * binary_matrix.sum())).sum()
-    l2_distance = np.sqrt(np.sum(np.square((identity - binary_matrix)))) / n_descriptions
-    l1_distance = np.sum(np.abs(identity - binary_matrix)) / n_descriptions
-
-    # If we predict constant label for all videos, cosine similarity will be equal to 1/n_descriptions, since only one guess will be correct
-    return {
-        "constant_baseline_cosine_similarity": 1 / n_descriptions,
-        "cosine_similarity": cosine_similarity,
-        "l2_distance": l2_distance,
-        "l1_distance": l1_distance,
-    }
-
 def compute_multiclass_metrics(average_similarities: torch.Tensor, true_labels: np.ndarray, verbose: bool) -> Dict[str, float]:
     n_samples, n_classes = average_similarities.shape
     predictions = np.argmax(average_similarities, axis=1)
@@ -141,6 +122,7 @@ def compute_multiclass_metrics(average_similarities: torch.Tensor, true_labels: 
     one_hot_true_labels[range(n_samples), true_labels] = 1
 
     if verbose:
+        # note: when using prpjection reward, numbers are very large by modulo, seems like a bug
         print("in compute_multiclass_metrics: average_similarities\n", average_similarities)
         print("="*70)
 
@@ -219,14 +201,14 @@ def main():
         for reward_name in args.rewards.split(","):
             if reward_name == "logit":
                 task_name2named_reward_functions[task_name].append(
-                    (logit_reward, f"{args.model}_logit_{task_name}_{args.experiment_id}")
+                    (util.logit_reward, f"{args.model}_logit_{task_name}_{args.experiment_id}")
                 )
             elif reward_name == "projection":
                 baselines = encoder.encode_text([task_name2baseline[task_name]] * len(data))
                 if args.alphas is None:
                     raise ValueError("Alpha must be provided when using projection reward.")
                 for alpha in args.alphas.split(","):
-                    reward_fun = mk_projection_reward(float(alpha), baselines)
+                    reward_fun = util.mk_projection_reward(float(alpha), baselines)
                     title = f"{args.model}_projection_{alpha}_{task_name}_{args.experiment_id}"
                     task_name2named_reward_functions[task_name].append((reward_fun, title))
             else:
@@ -249,7 +231,7 @@ def main():
             if args.verbose:
                 print(f"  ({j + 1}/{len(task_name2named_reward_functions[task_name])})   Evaluating {title}")
 
-            reward_matrix = evaluate(encoder, videos, descriptions, reward_fun)
+            reward_matrix = util.evaluate(encoder, videos, descriptions, reward_fun)
 
             average_similarities, std_similarities = util.aggregate_similarities_many_video_groups(
                 reward_matrix,
