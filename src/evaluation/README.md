@@ -3,7 +3,7 @@
 Add the following packages into your virtual environment:
 
 ```
-pip install imageio av seaborn python-dotenv openai
+pip install imageio av seaborn python-dotenv openai scikit-learn
 ```
 
 ## Models
