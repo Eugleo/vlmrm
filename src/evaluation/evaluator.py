@@ -280,6 +280,8 @@ def main():
 
 # Choosing model
     if args.model.lower() == "gpt4":
+        raise ValueError("gpt4 is not supported for all-vs-all evaluation with metrics yet")
+
         reward_matrix = gpt4(video_paths, descriptions)
         title = f"gpt4_{args.experiment_id}"
         util.make_heatmap(
