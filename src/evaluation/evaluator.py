@@ -3,7 +3,7 @@ import base64
 import json
 import re
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Dict
 
 import cv2
 import dotenv
@@ -11,13 +11,10 @@ import numpy as np
 import openai
 import pandas as pd
 import torch
-import vlmrm.reward.rewards as rewards
-from einops import rearrange
-from evaluation import util
-from torch import Tensor
 from torch.amp.autocast_mode import autocast
-from vlmrm.reward.encoders import CLIP, S3D, Encoder, ViCLIP
 
+from evaluation import util
+from vlmrm.reward.encoders import CLIP, S3D, Encoder, ViCLIP
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -69,56 +66,28 @@ def parse_args():
         default=False,
         action="store_true",
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--average-by-video",
+        action="store_true",
+        help="Use several videos of same action and average similarity"
+    )
+    parser.add_argument(
+        "--max-n-videos",
+        type=int,
+        default=10,
+        help="Max number of videos taken from each directory when `--average-by-video` is True"
+    )
     parser.add_argument("--cache-dir", default=".cache")
 
     args = parser.parse_args()
     return args
 
-
-def evaluate(
-    encoder: Encoder,
-    videos: list[Tensor],
-    descriptions: list[str],
-    reward: Callable[[Tensor, Tensor], Tensor],
-):
-    subsampled_videos = torch.stack([encoder.subsample(video) for video in videos])
-    # The encoder expects the input to be (frames, windows, episodes, c h w)
-    subsampled_videos = rearrange(subsampled_videos, "b f c h w -> f 1 b c h w")
-    # (f w e c h w) -> (w e d)
-    video_encodings = encoder.encode_video(subsampled_videos)
-    video_encodings = rearrange(video_encodings, "1 b d -> b d")
-
-    description_encodings = encoder.encode_text(descriptions)
-    description_encodings.to(video_encodings.device)
-
-    return reward(video_encodings, description_encodings)
-
-
-def logit_reward(video_encodings: Tensor, description_encodings: Tensor):
-    return rewards.logit_reward(
-        video_encodings, description_encodings, torch.arange(len(description_encodings))
-    )
-
-
-def mk_projection_reward(alpha: float, baselines: Tensor):
-    def reward(video_encodings: Tensor, description_encodings: Tensor) -> Tensor:
-        reward_cols = [
-            rewards.projection_reward(video_encodings, b, t.unsqueeze(0), alpha)
-            for t, b in zip(description_encodings, baselines)
-        ]
-        return torch.stack(reward_cols, dim=1)
-
-    return reward
-
-
-def subsample(x: torch.Tensor, frames: int) -> torch.Tensor:
-    n_frames, *_ = x.shape
-    step = n_frames // frames
-    x = x[::step, ...][:frames, ...]
-    return x
-
-
-def load_video(path: str, n_frames=5):
+def gpt4v_load_video(path: str, n_frames=5):
     video = cv2.VideoCapture(path)
 
     b64_frames = []
@@ -164,7 +133,7 @@ The car has moved through the roundabout and took the second exit.
     """
 
     # Subsample the frames from the videos
-    videos = [load_video(p) for p in video_paths]
+    videos = [gpt4v_load_video(p) for p in video_paths]
 
     matrix = np.zeros((len(videos), len(descriptions)))
 
@@ -240,6 +209,24 @@ The car has moved through the roundabout and took the second exit.
 
     return matrix
 
+def compute_all_vs_all_metrics(average_similarities: torch.Tensor) -> Dict[str, float]:
+    n_video_groups, n_descriptions = average_similarities.shape
+
+    identity = np.eye(n_descriptions)
+    # Need to treat broadcasting carefully here
+    binary_matrix = np.where(np.isclose(average_similarities, average_similarities.max(axis=1, keepdims=True)), 1, 0)
+
+    cosine_similarity = (binary_matrix * identity / np.sqrt(n_descriptions * binary_matrix.sum())).sum()
+    l2_distance = np.sqrt(np.sum(np.square((identity - binary_matrix)))) / n_descriptions
+    l1_distance = np.sum(np.abs(identity - binary_matrix)) / n_descriptions
+
+    # If we predict constant label for all videos, cosine similarity will be equal to 1/n_descriptions, since only one guess will be correct
+    return {
+        "constant_baseline_cosine_similarity": 1 / n_descriptions,
+        "cosine_similarity": cosine_similarity,
+        "l2_distance": l2_distance,
+        "l1_distance": l1_distance,
+    }
 
 @autocast("cuda", enabled=torch.cuda.is_available())
 def main():
@@ -247,22 +234,60 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     data = pd.read_csv(args.table_path)
-    video_paths = data["path"].to_list()
-    video_names = [Path(p).stem for p in video_paths]
-    videos = util.get_video_batch(video_paths, device)
     descriptions = data["label"].to_list()
 
+# Getting videos
+    video_paths = []
+    video_group_borders = [0]
+
+    for dir_path in data["path"].values:
+        # Sorted to ensure deterministic results
+        video_paths_group = sorted(list(Path(dir_path).glob("*.avi")))
+        video_paths.extend(video_paths_group[:args.max_n_videos] if args.average_by_video else video_paths_group[:1])
+        video_group_borders.append(len(video_paths))
+
+    videos = util.get_video_batch(video_paths, device)
+    video_group_names = [Path(p).stem for p in data["path"]]
+
+# Setting up output directory
+    experiment_dir = Path(args.output_dir) / args.experiment_id
+    experiment_dir.mkdir(parents=True, exist_ok=True)
+    title2metrics = {}
+
+# Choosing model
     if args.model.lower() == "gpt4":
+        print("="*70)
+        print("Warning: this was not debugged. Manually remove RuntimeError() if you are sure that you want to run this.")
+        print("="*70)
+        raise RuntimeError()
+
         reward_matrix = gpt4(video_paths, descriptions)
         title = f"gpt4_{args.experiment_id}"
-        util.make_heatmap(
+
+        average_similarities, std_similarities = util.aggregate_similarities_many_video_groups(
             reward_matrix,
+            prompt_group_borders=range(len(descriptions) + 1),
+            video_group_borders=video_group_borders,
+            do_normalize=args.standardize,
+        )
+
+        util.make_heatmap(
+            average_similarities,
             groups=data["group"].to_list(),
             trajectories_names=video_names,
             labels=descriptions,
-            result_dir=args.output_dir,
+            result_dir=str(experiment_dir),
             experiment_id=title,
         )
+
+        with open(experiment_dir / "metrics.json", "w") as f:
+            title2metrics[title] = compute_all_vs_all_metrics(average_similarities)
+            json.dump(title2metrics, f, indent=2)
+
+        np.save(experiment_dir / "reward_matrix.npy", reward_matrix)
+        np.save(experiment_dir / "average_similarities.npy", average_similarities)
+        np.save(experiment_dir / "std_similarites.npy", std_similarites)
+
         return
 
     assert isinstance(args.model, str)
@@ -283,33 +308,49 @@ def main():
         )
     encoder = encoder.to(device)
 
-    rewards = []
+# Parsing which reward functions we should try
+    named_reward_functions = []
     for reward_name in args.rewards.split(","):
         if reward_name == "logit":
-            rewards.append((logit_reward, f"{args.model}_logit_{args.experiment_id}"))
+            named_reward_functions.append((util.logit_reward, f"{args.model}_logit_{args.experiment_id}"))
         elif reward_name == "projection":
             baselines = encoder.encode_text(data["baseline"].to_list())
             if args.alphas is None:
                 raise ValueError("Alpha must be provided when using projection reward.")
             for alpha in args.alphas.split(","):
-                reward_fun = mk_projection_reward(float(alpha), baselines)
+                reward_fun = util.mk_projection_reward(float(alpha), baselines)
                 title = f"{args.model}_projection_{alpha}_{args.experiment_id}"
-                rewards.append((reward_fun, title))
+                named_reward_functions.append((reward_fun, title))
+        else:
+            raise ValueError(f"Unknown reward name {reward_name}")
 
-    for reward_fun, title in rewards:
-        reward_matrix = evaluate(encoder, videos, descriptions, reward_fun)
-        if args.standardize:
-            reward_matrix = (
-                reward_matrix - reward_matrix.mean(dim=0, keepdim=True)
-            ) / (reward_matrix.std(dim=0, keepdim=True) + 1e-6)
+# Running evaluations
+    for i, (reward_fun, title) in enumerate(named_reward_functions):
+        if args.verbose:
+            print(f"({i + 1}/{len(named_reward_functions)})   Evaluating {title}")
+
+        reward_matrix = util.evaluate(encoder, videos, descriptions, reward_fun)
+
+        average_similarities, std_similarities = util.aggregate_similarities_many_video_groups(
+            reward_matrix,
+            prompt_group_borders=range(len(descriptions) + 1),
+            video_group_borders=video_group_borders,
+            do_normalize=args.standardize,
+        )
+
         util.make_heatmap(
-            reward_matrix.cpu().numpy(),
+            average_similarities,
             groups=data["group"].to_list(),
-            trajectories_names=video_names,
+            trajectories_names=video_group_names,
             labels=descriptions,
-            result_dir=args.output_dir,
+            result_dir=str(experiment_dir),
             experiment_id=title,
         )
+
+        title2metrics[title] = compute_all_vs_all_metrics(average_similarities)
+
+    with open(experiment_dir / "metrics.json", "w") as f:
+        json.dump(title2metrics, f, indent=2)
 
 
 if __name__ == "__main__":
