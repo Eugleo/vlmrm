@@ -249,20 +249,45 @@ def main():
     videos = util.get_video_batch(video_paths, device)
     video_group_names = [Path(p).stem for p in data["path"]]
 
+# Setting up output directory
+    experiment_dir = Path(args.output_dir) / args.experiment_id
+    experiment_dir.mkdir(parents=True, exist_ok=True)
+    title2metrics = {}
+
 # Choosing model
     if args.model.lower() == "gpt4":
-        raise ValueError("gpt4 is not supported for all-vs-all evaluation with metrics yet")
+        print("="*70)
+        print("Warning: this was not debugged. Manually remove RuntimeError() if you are sure that you want to run this.")
+        print("="*70)
+        raise RuntimeError()
 
         reward_matrix = gpt4(video_paths, descriptions)
         title = f"gpt4_{args.experiment_id}"
-        util.make_heatmap(
+
+        average_similarities, std_similarities = util.aggregate_similarities_many_video_groups(
             reward_matrix,
+            prompt_group_borders=range(len(descriptions) + 1),
+            video_group_borders=video_group_borders,
+            do_normalize=args.standardize,
+        )
+
+        util.make_heatmap(
+            average_similarities,
             groups=data["group"].to_list(),
             trajectories_names=video_names,
             labels=descriptions,
-            result_dir=args.output_dir,
+            result_dir=str(experiment_dir),
             experiment_id=title,
         )
+
+        with open(experiment_dir / "metrics.json", "w") as f:
+            title2metrics[title] = compute_all_vs_all_metrics(average_similarities)
+            json.dump(title2metrics, f, indent=2)
+
+        np.save(experiment_dir / "reward_matrix.npy", reward_matrix)
+        np.save(experiment_dir / "average_similarities.npy", average_similarities)
+        np.save(experiment_dir / "std_similarites.npy", std_similarites)
+
         return
 
     assert isinstance(args.model, str)
@@ -300,10 +325,6 @@ def main():
             raise ValueError(f"Unknown reward name {reward_name}")
 
 # Running evaluations
-    experiment_dir = Path(args.output_dir) / args.experiment_id
-    experiment_dir.mkdir(parents=True, exist_ok=True)
-    title2metrics = {}
-
     for i, (reward_fun, title) in enumerate(named_reward_functions):
         if args.verbose:
             print(f"({i + 1}/{len(named_reward_functions)})   Evaluating {title}")

@@ -158,20 +158,56 @@ def main():
     videos = util.get_video_batch(video_paths, device)
     video_group_names = [Path(p).stem for p in data["path"]]
 
+# Setting up output directory
+    experiment_dir = Path(args.output_dir) / args.experiment_id
+    experiment_dir.mkdir(parents=True, exist_ok=True)
+    task_name2title2metrics = {}
+
 # Choosing model
     if args.model.lower() == "gpt4":
-        raise ValueError(f"gpt4 is not supported for multiclass evaluation yet")
+        print("="*70)
+        print("Warning: this was not debugged. Manually remove RuntimeError() if you are sure that you want to run this.")
+        print("="*70)
+        raise RuntimeError()
 
-        reward_matrix = gpt4(video_paths, descriptions)
-        title = f"gpt4_{args.experiment_id}"
-        util.make_heatmap(
-            reward_matrix,
-            groups=data["group"].to_list(),
-            trajectories_names=video_names,
-            labels=descriptions,
-            result_dir=args.output_dir,
-            experiment_id=title,
-        )
+        for task_name in task_name2baseline:
+            title = f"gpt4_{task_name}_{args.experiment_id}"
+
+            true_labels = data[task_name]
+            descriptions = [task_name2label2description[task_name][i]
+                for i in range(len(task_name2label2description[task_name]))]
+
+            reward_matrix = gpt4(video_paths, descriptions)
+            average_similarities, std_similarities = util.aggregate_similarities_many_video_groups(
+                reward_matrix,
+                prompt_group_borders=range(len(descriptions) + 1),
+                video_group_borders=video_group_borders,
+                do_normalize=args.standardize,
+            )
+
+            util.make_heatmap(
+                average_similarities,
+                groups=data["group"].to_list(),
+                trajectories_names=video_names,
+                labels=descriptions,
+                result_dir=str(experiment_dir),
+                experiment_id=title,
+            )
+
+            metrics = compute_multiclass_metrics(average_similarities, true_labels, args.verbose)
+
+            if task_name in task_name2title2metrics:
+                task_name2title2metrics[task_name][title] = metrics
+            else:
+                task_name2title2metrics[task_name] = {title: metrics}
+
+        with open(experiment_dir / "metrics.json", "w") as f:
+            json.dump(task_name2title2metrics, f, indent=2)
+
+        np.save(experiment_dir / "reward_matrix.npy", reward_matrix)
+        np.save(experiment_dir / "average_similarities.npy", average_similarities)
+        np.save(experiment_dir / "std_similarites.npy", std_similarites)
+
         return
 
     assert isinstance(args.model, str)
@@ -215,10 +251,6 @@ def main():
                 raise ValueError(f"Unknown reward name {reward_name}")
 
 # Running evaluations
-    experiment_dir = Path(args.output_dir) / args.experiment_id
-    experiment_dir.mkdir(parents=True, exist_ok=True)
-    task_name2title2metrics = {}
-
     for i, task_name in enumerate(task_name2named_reward_functions):
         if args.verbose:
             print(f"({i + 1}/{len(task_name2named_reward_functions)})  Task {task_name}")
