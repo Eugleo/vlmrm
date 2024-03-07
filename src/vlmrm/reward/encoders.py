@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List, Protocol
+from typing import List, Protocol, Tuple
 
 import open_clip
 import torch
@@ -155,7 +155,7 @@ class ViCLIP(nn.Module):
 
 class S3D(nn.Module):
     def __init__(
-        self, cache_dir: str, embedding_dim: int = 512, scale_factor: float = 1
+        self, cache_dir: str, embedding_dim: int = 512, target_size: Tuple[int, int] = (224, 224)
     ) -> None:
         super().__init__()
         embedding_dim = 512
@@ -163,7 +163,7 @@ class S3D(nn.Module):
         self._model.load_state_dict(torch.load(f"{cache_dir}/s3d_howto100m.pth"))
         self._model = self._model.eval()
 
-        self.scale_factor = scale_factor
+        self.target_size = target_size
         self.expected_n_frames = 32
 
     @torch.inference_mode()
@@ -179,7 +179,7 @@ class S3D(nn.Module):
     def _transform(self, x: torch.Tensor) -> torch.Tensor:
         if x.dtype not in (torch.float16, torch.float32, torch.float64):
             x = x.float() / 255
-        x = F.interpolate(x, mode="bicubic", scale_factor=self.scale_factor)
+        x = F.interpolate(x, mode="bicubic", size=self.target_size)
         x = x.clamp(0, 1)
         return x
 
