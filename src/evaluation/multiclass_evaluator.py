@@ -143,6 +143,7 @@ def main():
     data = pd.read_csv(args.table_path)
     label_descriptions = pd.read_csv(args.descriptions_for_class_labels)
 
+    # Dict[str, Dict[int, str]], Dict[str, str]
     task_name2label2description, task_name2baseline = get_descriptions_and_baselines_for_tasks(label_descriptions)
 
 # Getting videos
@@ -151,7 +152,8 @@ def main():
 
     for dir_path in data["path"].values:
         # Sorted to ensure deterministic results
-        video_paths_group = sorted(list(Path(dir_path).glob("*.avi")))
+        dir_path = Path(dir_path)
+        video_paths_group = sorted(list(dir_path.glob("*.avi")) + list(dir_path.glob("*.mp4")))
         video_paths.extend(video_paths_group[:args.max_n_videos] if args.average_by_video else video_paths_group[:1])
         video_group_borders.append(len(video_paths))
 
