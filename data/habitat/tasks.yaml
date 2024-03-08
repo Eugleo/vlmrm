@@ -1,4 +1,4 @@
-room_detection:
+- name: room_detection
   gpt4_prompt: |
     You will be given five frames from a video depicting a first-person video reconstruction taken in a 3D model of a house. Important notes:
     - the frames are given to you in chronological order
@@ -32,7 +32,7 @@ room_detection:
     living_room: first-person indoor footage in the living room
     unknown: first-person indoor footage in a room without a clear purpose
 
-object_detection:
+- name: object_detection
   baseline_prompt: first-person indoor footage
   label_prompts:
     tv: first-person footage in a room with a TV
