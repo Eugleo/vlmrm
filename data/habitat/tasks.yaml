@@ -30,6 +30,8 @@
     kitchen: first-person indoor footage in the kitchen
     laundry_room: first-person indoor footage in the laundry room
     living_room: first-person indoor footage in the living room
+    office: first-person indoor footage in a home office
+    stairs: first-person indoor footage on the stairs
     unknown: first-person indoor footage in a room without a clear purpose
 
 - name: object_detection
