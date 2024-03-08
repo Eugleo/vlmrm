@@ -177,6 +177,15 @@ def gpt4(video_paths, descriptions, prompt):
             for m in re.finditer(r"- (.+): ([\d.]+)", answer)
         }
 
+        vals = []
+        for d in descriptions:
+            if d in scores:
+                vals.append(scores[d])
+            else:
+                print("WARNING: description not found in scores:", d)
+                print("Video:", video_paths[i])
+                vals.append(1e-6)
+
         matrix[i, :] = torch.Tensor([scores[d] for d in descriptions])
 
         # with open("gpt4_scores.json", "w") as f:
