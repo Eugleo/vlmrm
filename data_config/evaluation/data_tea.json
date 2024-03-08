@@ -1,0 +1,41 @@
+{
+    "setting": "tea",
+    "videos": [
+        {
+            "path": "data/evaluation/set_down_cup.mp4",
+            "baseline": "a container of tea",
+            "label": "a cup of tea being set down",
+            "group": "tea1"
+        },
+        {
+            "path": "data/evaluation/flip_bottle_upside_down.mp4",
+            "baseline": "a container of tea",
+            "label": "a bottle of tea being flipped upside down",
+            "group": "tea2"
+        },
+        {
+            "path": "data/evaluation/knock_over_bottle.mp4",
+            "baseline": "a container of tea",
+            "label": "a bottle of tea being knocked over",
+            "group": "tea2"
+        },
+        {
+            "path": "data/evaluation/pick_up_bottle.mp4",
+            "baseline": "a container of tea",
+            "label": "a bottle of tea being picked up",
+            "group": "tea2"
+        },
+        {
+            "path": "data/evaluation/set_down_bottle.mp4",
+            "baseline": "a container of tea",
+            "label": "a bottle of tea being set down",
+            "group": "tea2"
+        },
+        {
+            "path": "data/evaluation/shake_bottle.mp4",
+            "baseline": "a container of tea",
+            "label": "a bottle of tea being shaken",
+            "group": "tea2"
+        }
+    ]
+}

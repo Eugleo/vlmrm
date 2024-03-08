@@ -1,0 +1,44 @@
+[
+    {
+        "setting": "obstacle_course",
+        "subject": "red car",
+        "task_specific_notes": [
+            "the car sometimes doesn't follow any roads at all and just rides on grass",
+            "the car sometimes DOES follow roads, so be sure to check this specifically",
+            "the car doesn't necessarily start at the bottom and go up; to observe the car's movement, you need to compare position of the car between the frames"
+        ],
+        "objects": [
+            "car",
+            "roads",
+            "crossroads"
+        ],
+        "frame_descriptions": [
+            "The car is approaching a roundabout",
+            "The car is now closer to the roundabout",
+            "The car is at the roundabout, past the first exit",
+            "The car appears to be taking the second exit",
+            "The car continues along the road after the roundabout"
+        ],
+        "overall_summary": "The car has moved through the roundabout and taken the second exit."
+    },
+    {
+        "setting": "tea",
+        "subject": "container of tea",
+        "task_specific_notes": [
+            "the container is sometimes being held by a person, and sometimes standing on a surface"
+        ],
+        "objects": [
+            "container",
+            "tea",
+            "hand"
+        ],
+        "frame_descriptions": [
+            "The container of tea is sitting on a table",
+            "The container is still sitting on a table",
+            "Someone's hand is reaching for the container from the top right corner of the frame",
+            "The hand is closer to the container",
+            "The hand has picked up the container off the table"
+        ],
+        "overall_summary": "The container of tea is picked up from a table."
+    }
+]

@@ -1,9 +1,11 @@
 import argparse
 import base64
+import backoff
 import json
 import re
 from pathlib import Path
 from typing import Callable
+import logging
 
 import cv2
 import dotenv
@@ -18,6 +20,8 @@ from torch import Tensor
 from torch.amp.autocast_mode import autocast
 from vlmrm.reward.encoders import CLIP, S3D, Encoder, ViCLIP
 
+USE_FUNCTION_CALLING = False  # Function calling doesn't exist for gpt-4-vision-preview yet
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -26,7 +30,7 @@ def parse_args():
     parser.add_argument(
         "-t",
         "--table-path",
-        help="Path to a csv table containing video paths and their descriptions.",
+        help="Path to a json file containing video paths and their descriptions.",
         required=True,
     )
     parser.add_argument(
@@ -68,6 +72,11 @@ def parse_args():
         help="Directory to save evaluation results.",
         default=False,
         action="store_true",
+    )
+    parser.add_argument(
+        "--gpt4-info",
+        help="Path to a json file containing the gpt4-specific info.",
+        default=None,
     )
     parser.add_argument("--cache-dir", default=".cache")
 
@@ -137,31 +146,70 @@ def load_video(path: str, n_frames=5):
 
     return b64_frames
 
+def parse_text_scores(score_response):
+        answer = score_response.choices[0].message.content
 
-def gpt4(video_paths, descriptions):
-    prompt = """
-You will be given five frames from a video depicting a red car. Important notes:
+        print(answer)
+
+        # Parse out the scores which are in the format "- description: score"
+        scores = {
+            m.group(1): float(m.group(2))
+            for m in re.finditer(r"- (.+): ([\d.]+)", answer)
+        }
+
+        return scores
+
+@backoff.on_exception(backoff.expo, # openai.APIError, openai.OpenAIError,
+    (openai.ConflictError, openai.APIStatusError, openai.RateLimitError, openai.APITimeoutError, openai.APIConnectionError, openai.InternalServerError, openai.UnprocessableEntityError, openai.APIResponseValidationError),
+    logger=logging.getLogger(__name__))
+def openai_call_wrapper(client, *args, **kwargs):
+    return client.chat.completions.create(*args, **kwargs)
+
+# gpt4(["data/evaluation/set_down_cup.mp4"], ["A cup of tea being set down", "A cup of tea being picked up", "A cup of tea being spilled", "A cup of water being set down"])
+def gpt4(video_paths, descriptions, task_info):
+    newline = "\n"  # hack to get around the fact that f-string expressions can't contain backslashes
+    prompt = f"""
+You will be given five frames from a video depicting a {task_info["subject"]}. Important notes:
 - the frames are given in chronological order
 - the camera is fixed and doesn't move or rotate throughout the video
-- the car sometimes doesn't follow any roads at all and just rides on grass
-- the car sometimes DOES follow roads, so be sure to check this specifically
-- the car doesn't necessarily start at the bottom and go up; to observe the car's movement, you need to compare position of the car between the frames
-
-Your task is to describe what you see. Focus on the relative positions of the depicted objects (car, roads, potential crossroads, etc), their orientation, and the movement of the car between the frames. Be precise, but brief. Describe EACH OF THE FIVE FRAMES. The frames are NOT static and they DO change, although sometimes the change is small frame to frame.
+{f"{newline}- ".join(task_info["task_specific_notes"])}
+Your task is to describe what you see. Focus on the relative positions of the depicted objects ({", ".join(task_info["objects"])}, etc), their orientation, and the movement of the {task_info["subject"]} between the frames. Be precise, but brief. Describe EACH OF THE FIVE FRAMES. The frames are NOT static and they DO change, although sometimes the change is small frame to frame.
 
 # EXAMPLE
 
 Input: [five frames]
 
 Assistant:
-0. The car is approaching a roundabout
-1. The car is now closer to the roundabout
-2. The car is at the roundabout, rode by the first exit
-3. The car appears to be taking the second exit
-4. The car continues along the road after the roundabout
+{newline.join([f"{n}. {d}" for n, d in zip(range(5), task_info["frame_descriptions"])])}
 
-The car has moved through the roundabout and took the second exit.
-    """
+{task_info["overall_summary"]}
+"""
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "record_video_score",
+                "description": "Record the scores of how closely the potential video descriptions match the video/frames. The input an array of pairs of text descriptions and their corresponding scores, which are floats from 0 to 1. Multiple descriiptions may have the same score. Only give a score of 0 or 1 if you're absolutely certain; this should be very rare.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "scores": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "description": {"type": "string"},
+                                    "score": {"type": "number"},
+                                },
+                            },
+                        }
+                    },
+                    "required": ["scores"],
+                },
+            },
+        },
+    ]
 
     # Subsample the frames from the videos
     videos = [load_video(p) for p in video_paths]
@@ -172,11 +220,6 @@ The car has moved through the roundabout and took the second exit.
         print("===========================")
         print(video_paths[i])
         print(descriptions[i])
-
-        # save the frames as separate images
-        for j, frame in enumerate(video):
-            with open(f"frames/{video_paths[i].split('/')[-1]}_{j}.jpg", "wb") as f:
-                f.write(base64.b64decode(frame))
 
         dotenv.load_dotenv()
         client = openai.OpenAI()  # API KEY should be loaded automatically by line above
@@ -200,9 +243,12 @@ The car has moved through the roundabout and took the second exit.
                 ],
             },
         ]
-        response = client.chat.completions.create(
-            model="gpt-4-vision-preview", messages=messages, max_tokens=900
-        )
+        if USE_FUNCTION_CALLING:
+            response = openai_call_wrapper(client, model="gpt-4-vision-preview", messages=messages, max_tokens=900, tools=tools)
+            scoring_task_description = 'Now, score the following potential video descriptions from 0 to 1 based on how well they fit the video/frames you\'ve seen. Feel free to use values between 0 and 1, too. Multiple labels can have the same score. The directions (e.g. "car turning left") are written from the POV of the driver of the car unless specified otherwise. Then record the scores using the `record_video_score` function.\n\nPotential video descriptions:\n'
+        else:
+            response = openai_call_wrapper(client, model="gpt-4-vision-preview", messages=messages, max_tokens=900)
+            scoring_task_description = 'Now, given this description, score the following potential video descriptions from 0 to 1 based on how well they fit the video/frames you\'ve seen. Feel free to use values between 0 and 1, too. Multiple labels can have the same score. The directions (e.g. "car turning left") are written from the POV of the driver of the car unless specified otherwise.\n\nFormat: \n- description: score\n\n'
         # Add response.choices[0].message.content to the messages list
         messages.append(
             {"role": "assistant", "content": response.choices[0].message.content}
@@ -214,8 +260,7 @@ The car has moved through the roundabout and took the second exit.
                 "content": [
                     {
                         "type": "text",
-                        "text": 'Now, given this description, score the following potential video descriptions from 0 to 1 based on how well they fit the video/frames you\'ve seen. Feel free to use values between 0 and 1, too. Multiple labels can have the same score. The directions (e.g. "car turning left") are written from the POV of the driver of the car unless specified otherwise.\n\nFormat: \n- description: score\n\n'
-                        + "\n".join([f"- {d}" for d in set(descriptions)]),
+                        "text": scoring_task_description + "\n".join([f"- {d}" for d in set(descriptions)]),
                     }
                 ],
             }
@@ -223,16 +268,23 @@ The car has moved through the roundabout and took the second exit.
         response = client.chat.completions.create(
             model="gpt-4-vision-preview", messages=messages, max_tokens=900
         )
-        answer = response.choices[0].message.content
 
-        print(answer)
+        if USE_FUNCTION_CALLING:
+            # check if the model used a tool response
+            if "tools" in response.choices[0].message:
+                for tool in response.choices[0].message.tools:
+                    if tool.name == "record_video_score":
+                        video_scores = tool.parameters.scores
+                        break
+            else:
+                video_scores = []
 
-        # Parse out the scores which are in the format "- description: score"
-        scores = {
-            m.group(1): float(m.group(2))
-            for m in re.finditer(r"- (.+): ([\d.]+)", answer)
-        }
-
+            # convert video_scores to a dictionary
+            video_scores_dict = {d["description"]: d["score"] for d in video_scores}
+            scores = {d: video_scores_dict[d] for d in descriptions}
+        else:
+            scores = parse_text_scores(response)
+            
         matrix[i, :] = [scores[d] for d in descriptions]
 
         # with open("gpt4_scores.json", "w") as f:
@@ -246,14 +298,29 @@ def main():
     args = parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    data = pd.read_csv(args.table_path)
+    with open(args.table_path, "r") as f:
+        data_json = json.load(f)
+    data = pd.DataFrame(data_json["videos"])
+
+    # data = pd.read_csv(args.table_path)
+    
     video_paths = data["path"].to_list()
     video_names = [Path(p).stem for p in video_paths]
     videos = util.get_video_batch(video_paths, device)
     descriptions = data["label"].to_list()
 
     if args.model.lower() == "gpt4":
-        reward_matrix = gpt4(video_paths, descriptions)
+        if args.gpt4_info is None:
+            raise ValueError("GPT-4 info must be provided when using GPT-4.")
+        with open(args.gpt4_info, "r") as f:
+            gpt4_info_all = json.load(f)
+        gpt4_infos = [infoblock for infoblock in gpt4_info_all if infoblock["setting"] == data_json["setting"]]
+        if len(gpt4_infos) == 0:
+            raise ValueError("no matching gpt4 info block")
+        if len(gpt4_infos) > 1:
+            logging.warn("multiple matching gpt4 info blocks")
+        gpt4_info = gpt4_infos[0]
+        reward_matrix = gpt4(video_paths, descriptions, gpt4_info)
         title = f"gpt4_{args.experiment_id}"
         util.make_heatmap(
             reward_matrix,
