@@ -12,6 +12,7 @@ import openai
 import pandas as pd
 import torch
 import vlmrm.reward.rewards as rewards
+import yaml
 from einops import rearrange
 from evaluation import util
 from evaluation.evaluator import gpt4, gpt4v_load_video
@@ -26,15 +27,15 @@ def parse_args():
         description="Run a set of zero-shot multiclass evaluations."
     )
     parser.add_argument(
-        "-t",
-        "--table-path",
+        "-d",
+        "--data",
         help="Path to a csv table containing video paths and their labels for each multiclass task.",
         required=True,
     )
     parser.add_argument(
-        "-d",
-        "--descriptions-for-class-labels",
-        help="Path to a csv table containing class descriptions for all tasks.",
+        "-t",
+        "--tasks",
+        help="Path to a yaml file containing task definitions (labels, prompts).",
         required=True,
     )
     parser.add_argument(
@@ -99,39 +100,11 @@ def parse_args():
     return args
 
 
-def get_descriptions_and_baselines_for_tasks(
-    label_descriptions: pd.DataFrame,
-) -> Tuple[Dict[str, Dict[int, str]], Dict[str, str]]:
-    name2label2description: Dict[str, Dict[int, str]] = {}
-    name2baseline: Dict[str, str] = {}
-
-    for (
-        task_name,
-        label_id,
-        baseline_prompt,
-        label_prompt,
-    ) in label_descriptions.itertuples(index=False):
-        if task_name not in name2label2description:
-            name2label2description[task_name] = {label_id: label_prompt}
-            name2baseline[task_name] = baseline_prompt
-        else:
-            assert (
-                name2baseline[task_name] == baseline_prompt
-            ), f"Found differing baseline prompts within task {task_name}, {name2baseline[task_name]} and {baseline_prompt}"
-
-            name2label2description[task_name][label_id] = label_prompt
-
-    return name2label2description, name2baseline
-
-
 def compute_multiclass_metrics(
     average_similarities: torch.Tensor, true_labels: np.ndarray, verbose: bool
 ) -> Dict[str, float]:
     n_samples, n_classes = average_similarities.shape
     predictions = np.argmax(average_similarities, axis=1)
-
-    one_hot_true_labels = np.zeros((n_samples, n_classes))
-    one_hot_true_labels[range(n_samples), true_labels] = 1
 
     if verbose:
         # note: when using prpjection reward, numbers are very large by modulo, seems like a bug
@@ -140,6 +113,11 @@ def compute_multiclass_metrics(
             average_similarities,
         )
         print("=" * 70)
+        print(f"{true_labels.shape=}, {predictions.shape=}")
+        print(f"{true_labels=}, {predictions=}")
+
+    one_hot_true_labels = np.zeros((n_samples, n_classes))
+    one_hot_true_labels[range(n_samples), true_labels] = 1
 
     # random performance will score 0 in adjusted_balanced_accuracy
     return {
@@ -163,33 +141,27 @@ def main():
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    data = pd.read_csv(args.table_path)
-    label_descriptions = pd.read_csv(args.descriptions_for_class_labels)
+    data = pd.read_csv(args.data)
 
-    # Dict[str, Dict[int, str]], Dict[str, str]
-    task_name2label2description, task_name2baseline = (
-        get_descriptions_and_baselines_for_tasks(label_descriptions)
-    )
+    tasks = []
+    with open(args.tasks) as stream:
+        try:
+            tasks = yaml.safe_load(stream)
+        except yaml.YAMLError as exc:
+            print(exc)
+
+    task_name2baseline = {task["name"]: task["baseline_prompt"] for task in tasks}
+    task_name2label2description = {
+        task["name"]: task["label_prompts"] for task in tasks
+    }
+    task_name2prompt = {task["name"]: task["gpt4_prompt"] for task in tasks}
 
     # Getting videos
-    video_paths = []
-    video_group_borders = [0]
-
-    for dir_path in data["path"].values:
-        # Sorted to ensure deterministic results
-        dir_path = Path(dir_path)
-        video_paths_group = sorted(
-            list(dir_path.glob("*.avi")) + list(dir_path.glob("*.mp4"))
-        )
-        video_paths.extend(
-            video_paths_group[: args.max_n_videos]
-            if args.average_by_video
-            else video_paths_group[:1]
-        )
-        video_group_borders.append(len(video_paths))
+    video_paths = data["path"].to_list()
+    # TODO: Groups are probably not needed (we will group by task), remove
+    video_group_borders = list(range(len(video_paths) + 1))
 
     videos = util.get_video_batch(video_paths, device)
-    video_group_names = [Path(p).stem for p in data["path"]]
 
     # Setting up output directory
     experiment_dir = Path(args.output_dir) / args.experiment_id
@@ -198,40 +170,36 @@ def main():
 
     # Choosing model
     if args.model.lower() == "gpt4":
-        print("=" * 70)
-        print(
-            "Warning: this was not debugged. Manually remove RuntimeError() if you are sure that you want to run this."
-        )
-        print("=" * 70)
-        raise RuntimeError()
-
         for task_name in task_name2baseline:
             title = f"gpt4_{task_name}_{args.experiment_id}"
 
-            true_labels = data[task_name]
-            descriptions = [
-                task_name2label2description[task_name][i]
-                for i in range(len(task_name2label2description[task_name]))
-            ]
+            label_name_to_index = {
+                label: i
+                for i, label in enumerate(task_name2label2description[task_name])
+            }
+            true_labels = np.array([label_name_to_index[l] for l in data[task_name]])
+            descriptions = list(task_name2label2description[task_name].values())
 
-            reward_matrix = gpt4(video_paths, descriptions)
-            average_similarities, std_similarities = (
-                util.aggregate_similarities_many_video_groups(
-                    reward_matrix,
-                    prompt_group_borders=range(len(descriptions) + 1),
-                    video_group_borders=video_group_borders,
-                    do_normalize=args.standardize,
-                )
-            )
+            reward_matrix = gpt4(video_paths, descriptions, task_name2prompt[task_name])
+            # average_similarities, std_similarities = (
+            #     util.aggregate_similarities_many_video_groups(
+            #         reward_matrix,
+            #         prompt_group_borders=range(len(descriptions) + 1),
+            #         video_group_borders=video_group_borders,
+            #         do_normalize=args.standardize,
+            #     )
+            # )
 
-            util.make_heatmap(
-                average_similarities,
-                groups=data["group"].to_list(),
-                trajectories_names=video_names,
-                labels=descriptions,
-                result_dir=str(experiment_dir),
-                experiment_id=title,
-            )
+            average_similarities = reward_matrix
+
+            # util.make_heatmap(
+            #     average_similarities,
+            #     groups=data["group"].to_list(),
+            #     trajectories_names=video_names,
+            #     labels=descriptions,
+            #     result_dir=str(experiment_dir),
+            #     experiment_id=title,
+            # )
 
             metrics = compute_multiclass_metrics(
                 average_similarities, true_labels, args.verbose
@@ -245,13 +213,14 @@ def main():
         with open(experiment_dir / "metrics.json", "w") as f:
             json.dump(task_name2title2metrics, f, indent=2)
 
-        np.save(experiment_dir / "reward_matrix.npy", reward_matrix)
-        np.save(experiment_dir / "average_similarities.npy", average_similarities)
-        np.save(experiment_dir / "std_similarites.npy", std_similarites)
+        # np.save(experiment_dir / "reward_matrix.npy", reward_matrix)
+        # np.save(experiment_dir / "average_similarities.npy", average_similarities)
+        # np.save(experiment_dir / "std_similarites.npy", std_similarites)
 
         return
 
     assert isinstance(args.model, str)
+
     if args.model.lower() == "viclip":
         encoder = ViCLIP(args.cache_dir)
     elif args.model.lower() == "s3d":
@@ -285,7 +254,8 @@ def main():
                 )
             elif reward_name == "projection":
                 baselines = encoder.encode_text(
-                    [task_name2baseline[task_name]] * len(data)
+                    [task_name2baseline[task_name]]
+                    * len(task_name2label2description[task_name])
                 )
                 if args.alphas is None:
                     raise ValueError(
@@ -307,11 +277,12 @@ def main():
                 f"({i + 1}/{len(task_name2named_reward_functions)})  Task {task_name}"
             )
 
-        true_labels = data[task_name]
-        descriptions = [
-            task_name2label2description[task_name][i]
-            for i in range(len(task_name2label2description[task_name]))
-        ]
+        descriptions = list(task_name2label2description[task_name].values())
+
+        label_name_to_index = {
+            label: i for i, label in enumerate(task_name2label2description[task_name])
+        }
+        true_labels = np.array([label_name_to_index[l] for l in data[task_name]])
 
         for j, (reward_fun, title) in enumerate(
             task_name2named_reward_functions[task_name]
@@ -323,14 +294,18 @@ def main():
 
             reward_matrix = util.evaluate(encoder, videos, descriptions, reward_fun)
 
-            average_similarities, std_similarities = (
-                util.aggregate_similarities_many_video_groups(
-                    reward_matrix,
-                    prompt_group_borders=range(len(descriptions) + 1),
-                    video_group_borders=video_group_borders,
-                    do_normalize=args.standardize,
-                )
-            )
+            # TODO: Groups are probably not needed (we will group by task), remove
+            # ...unless we want to test many alternative labels, but maybe we don't need to
+            # average_similarities, std_similarities = (
+            #     util.aggregate_similarities_many_video_groups(
+            #         reward_matrix,
+            #         prompt_group_borders=range(len(descriptions) + 1),
+            #         video_group_borders=video_group_borders,
+            #         do_normalize=args.standardize,
+            #     )
+            # )
+
+            average_similarities = reward_matrix.cpu().numpy()
 
             # util.make_heatmap(
             #     average_similarities,
