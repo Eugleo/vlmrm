@@ -3,7 +3,7 @@ import base64
 import json
 import re
 from pathlib import Path
-from typing import Callable, Dict, Tuple
+from typing import Callable, Dict, Tuple, List, Union
 
 import cv2
 import dotenv
@@ -16,7 +16,7 @@ import yaml
 from einops import rearrange
 from evaluation import util
 from evaluation.evaluator import gpt4, gpt4v_load_video
-from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_score
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_score, confusion_matrix
 from torch import Tensor
 from torch.amp.autocast_mode import autocast
 from vlmrm.reward.encoders import CLIP, S3D, Encoder, ViCLIP
@@ -99,10 +99,11 @@ def parse_args():
     args = parser.parse_args()
     return args
 
+ConfusionMatrix = List[List[int]]
 
 def compute_multiclass_metrics(
     average_similarities: torch.Tensor, true_labels: np.ndarray, verbose: bool
-) -> Dict[str, float]:
+) -> Dict[str, Union[float, ConfusionMatrix]]:
     n_samples, n_classes = average_similarities.shape
     predictions = np.argmax(average_similarities, axis=1)
 
@@ -132,6 +133,7 @@ def compute_multiclass_metrics(
             multi_class="ovr",
             average="micro",
         ),
+        "confusion_matrix": confusion_matrix(true_labels, predictions).tolist(),
     }
 
 
