@@ -1,0 +1,44 @@
+room_detection:
+  gpt4_prompt: |
+    You will be given five frames from a video depicting a first-person video reconstruction taken in a 3D model of a house. Important notes:
+    - the frames are given to you in chronological order
+    - due to compression and modelling issues, there might be some artifacts in the frames
+
+    Your task is to describe what you see in each frame. Focus on general context and notable objects. Describe each frame separately.
+
+    # EXAMPLE
+
+    Input: [five frames]
+
+    Assistant:
+    0. The room appears to be a living room.
+    1. In this frame, we can see a TV and a couch.
+    2. Additionally, there is a coffee table in the middle of the room.
+    3. In this frame, we can see that the room seems to be adjacent to a kitchen.
+    4. We are still in the living room, heading towards the kitchen.
+
+    # TASK
+  baseline_prompt: first-person indoor footage
+  label_prompts:
+    bathroom: first-person indoor footage in the bathroom
+    bedroom: first-person indoor footage in the bedroom
+    dining_room: first-person indoor footage in the dining room
+    dressing_room: first-person indoor footage in the dressing room
+    garage: first-person indoor footage in the garage
+    hall: first-person indoor footage in the hall
+    kids_room: first-person indoor footage in the kids room
+    kitchen: first-person indoor footage in the kitchen
+    laundry_room: first-person indoor footage in the laundry room
+    living_room: first-person indoor footage in the living room
+    unknown: first-person indoor footage in a room without a clear purpose
+
+object_detection:
+  baseline_prompt: first-person indoor footage
+  label_prompts:
+    tv: first-person footage in a room with a TV
+    office_chair: first-person footage in a room with an office chair with wheels
+    toilet: first-person footage in a room with a toilet
+    plant: first-person footage in a room with a potted plant
+    bathroom_no_toilet: first-person footage in a bathroom without a toilet
+    plant_and_tv: first-person footage in a room with a TV and a potted plant
+    none: first-person footage in a room without a TV, office chair, and potted plant
