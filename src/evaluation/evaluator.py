@@ -11,10 +11,10 @@ import numpy as np
 import openai
 import pandas as pd
 import torch
-from torch.amp.autocast_mode import autocast
-
 from evaluation import util
+from torch.amp.autocast_mode import autocast
 from vlmrm.reward.encoders import CLIP, S3D, Encoder, ViCLIP
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -74,18 +74,19 @@ def parse_args():
     parser.add_argument(
         "--average-by-video",
         action="store_true",
-        help="Use several videos of same action and average similarity"
+        help="Use several videos of same action and average similarity",
     )
     parser.add_argument(
         "--max-n-videos",
         type=int,
         default=10,
-        help="Max number of videos taken from each directory when `--average-by-video` is True"
+        help="Max number of videos taken from each directory when `--average-by-video` is True",
     )
     parser.add_argument("--cache-dir", default=".cache")
 
     args = parser.parse_args()
     return args
+
 
 def gpt4v_load_video(path: str, n_frames=5):
     video = cv2.VideoCapture(path)
@@ -107,35 +108,11 @@ def gpt4v_load_video(path: str, n_frames=5):
     return b64_frames
 
 
-def gpt4(video_paths, descriptions):
-    prompt = """
-You will be given five frames from a video depicting a red car. Important notes:
-- the frames are given in chronological order
-- the camera is fixed and doesn't move or rotate throughout the video
-- the car sometimes doesn't follow any roads at all and just rides on grass
-- the car sometimes DOES follow roads, so be sure to check this specifically
-- the car doesn't necessarily start at the bottom and go up; to observe the car's movement, you need to compare position of the car between the frames
-
-Your task is to describe what you see. Focus on the relative positions of the depicted objects (car, roads, potential crossroads, etc), their orientation, and the movement of the car between the frames. Be precise, but brief. Describe EACH OF THE FIVE FRAMES. The frames are NOT static and they DO change, although sometimes the change is small frame to frame.
-
-# EXAMPLE
-
-Input: [five frames]
-
-Assistant:
-0. The car is approaching a roundabout
-1. The car is now closer to the roundabout
-2. The car is at the roundabout, rode by the first exit
-3. The car appears to be taking the second exit
-4. The car continues along the road after the roundabout
-
-The car has moved through the roundabout and took the second exit.
-    """
-
+def gpt4(video_paths, descriptions, prompt):
     # Subsample the frames from the videos
     videos = [gpt4v_load_video(p) for p in video_paths]
 
-    matrix = np.zeros((len(videos), len(descriptions)))
+    matrix = torch.zeros((len(videos), len(descriptions)))
 
     for i, video in enumerate(videos):
         print("===========================")
@@ -143,9 +120,9 @@ The car has moved through the roundabout and took the second exit.
         print(descriptions[i])
 
         # save the frames as separate images
-        for j, frame in enumerate(video):
-            with open(f"frames/{video_paths[i].split('/')[-1]}_{j}.jpg", "wb") as f:
-                f.write(base64.b64decode(frame))
+        # for j, frame in enumerate(video):
+        #     with open(f"frames/{video_paths[i].split('/')[-1]}_{j}.jpg", "wb") as f:
+        #         f.write(base64.b64decode(frame))
 
         dotenv.load_dotenv()
         client = openai.OpenAI()  # API KEY should be loaded automatically by line above
@@ -202,22 +179,33 @@ The car has moved through the roundabout and took the second exit.
             for m in re.finditer(r"- (.+): ([\d.]+)", answer)
         }
 
-        matrix[i, :] = [scores[d] for d in descriptions]
+        matrix[i, :] = torch.Tensor([scores[d] for d in descriptions])
 
         # with open("gpt4_scores.json", "w") as f:
         #     json.dump(matrix.tolist(), f)
 
-    return matrix
+    return matrix.softmax(dim=1).cpu().numpy()
+
 
 def compute_all_vs_all_metrics(average_similarities: torch.Tensor) -> Dict[str, float]:
     n_video_groups, n_descriptions = average_similarities.shape
 
     identity = np.eye(n_descriptions)
     # Need to treat broadcasting carefully here
-    binary_matrix = np.where(np.isclose(average_similarities, average_similarities.max(axis=1, keepdims=True)), 1, 0)
+    binary_matrix = np.where(
+        np.isclose(
+            average_similarities, average_similarities.max(axis=1, keepdims=True)
+        ),
+        1,
+        0,
+    )
 
-    cosine_similarity = (binary_matrix * identity / np.sqrt(n_descriptions * binary_matrix.sum())).sum()
-    l2_distance = np.sqrt(np.sum(np.square((identity - binary_matrix)))) / n_descriptions
+    cosine_similarity = (
+        binary_matrix * identity / np.sqrt(n_descriptions * binary_matrix.sum())
+    ).sum()
+    l2_distance = (
+        np.sqrt(np.sum(np.square((identity - binary_matrix)))) / n_descriptions
+    )
     l1_distance = np.sum(np.abs(identity - binary_matrix)) / n_descriptions
 
     # If we predict constant label for all videos, cosine similarity will be equal to 1/n_descriptions, since only one guess will be correct
@@ -228,6 +216,7 @@ def compute_all_vs_all_metrics(average_similarities: torch.Tensor) -> Dict[str, 
         "l1_distance": l1_distance,
     }
 
+
 @autocast("cuda", enabled=torch.cuda.is_available())
 def main():
     args = parse_args()
@@ -236,39 +225,47 @@ def main():
     data = pd.read_csv(args.table_path)
     descriptions = data["label"].to_list()
 
-# Getting videos
+    # Getting videos
     video_paths = []
     video_group_borders = [0]
 
     for dir_path in data["path"].values:
         # Sorted to ensure deterministic results
         video_paths_group = sorted(list(Path(dir_path).glob("*.avi")))
-        video_paths.extend(video_paths_group[:args.max_n_videos] if args.average_by_video else video_paths_group[:1])
+        video_paths.extend(
+            video_paths_group[: args.max_n_videos]
+            if args.average_by_video
+            else video_paths_group[:1]
+        )
         video_group_borders.append(len(video_paths))
 
     videos = util.get_video_batch(video_paths, device)
     video_group_names = [Path(p).stem for p in data["path"]]
 
-# Setting up output directory
+    # Setting up output directory
     experiment_dir = Path(args.output_dir) / args.experiment_id
     experiment_dir.mkdir(parents=True, exist_ok=True)
     title2metrics = {}
 
-# Choosing model
+    # Choosing model
     if args.model.lower() == "gpt4":
-        print("="*70)
-        print("Warning: this was not debugged. Manually remove RuntimeError() if you are sure that you want to run this.")
-        print("="*70)
+        print("=" * 70)
+        print(
+            "Warning: this was not debugged. Manually remove RuntimeError() if you are sure that you want to run this."
+        )
+        print("=" * 70)
         raise RuntimeError()
 
         reward_matrix = gpt4(video_paths, descriptions)
         title = f"gpt4_{args.experiment_id}"
 
-        average_similarities, std_similarities = util.aggregate_similarities_many_video_groups(
-            reward_matrix,
-            prompt_group_borders=range(len(descriptions) + 1),
-            video_group_borders=video_group_borders,
-            do_normalize=args.standardize,
+        average_similarities, std_similarities = (
+            util.aggregate_similarities_many_video_groups(
+                reward_matrix,
+                prompt_group_borders=range(len(descriptions) + 1),
+                video_group_borders=video_group_borders,
+                do_normalize=args.standardize,
+            )
         )
 
         util.make_heatmap(
@@ -308,11 +305,13 @@ def main():
         )
     encoder = encoder.to(device)
 
-# Parsing which reward functions we should try
+    # Parsing which reward functions we should try
     named_reward_functions = []
     for reward_name in args.rewards.split(","):
         if reward_name == "logit":
-            named_reward_functions.append((util.logit_reward, f"{args.model}_logit_{args.experiment_id}"))
+            named_reward_functions.append(
+                (util.logit_reward, f"{args.model}_logit_{args.experiment_id}")
+            )
         elif reward_name == "projection":
             baselines = encoder.encode_text(data["baseline"].to_list())
             if args.alphas is None:
@@ -324,18 +323,20 @@ def main():
         else:
             raise ValueError(f"Unknown reward name {reward_name}")
 
-# Running evaluations
+    # Running evaluations
     for i, (reward_fun, title) in enumerate(named_reward_functions):
         if args.verbose:
             print(f"({i + 1}/{len(named_reward_functions)})   Evaluating {title}")
 
         reward_matrix = util.evaluate(encoder, videos, descriptions, reward_fun)
 
-        average_similarities, std_similarities = util.aggregate_similarities_many_video_groups(
-            reward_matrix,
-            prompt_group_borders=range(len(descriptions) + 1),
-            video_group_borders=video_group_borders,
-            do_normalize=args.standardize,
+        average_similarities, std_similarities = (
+            util.aggregate_similarities_many_video_groups(
+                reward_matrix,
+                prompt_group_borders=range(len(descriptions) + 1),
+                video_group_borders=video_group_borders,
+                do_normalize=args.standardize,
+            )
         )
 
         util.make_heatmap(
