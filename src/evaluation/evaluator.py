@@ -116,8 +116,6 @@ def gpt4(video_paths, descriptions, prompt):
 
     for i, video in enumerate(videos):
         print("===========================")
-        print(video_paths[i])
-        print(descriptions[i])
 
         # save the frames as separate images
         # for j, frame in enumerate(video):
