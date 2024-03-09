@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from typing import Callable, Dict
 
+import backoff
 import cv2
 import dotenv
 import numpy as np
@@ -108,88 +109,97 @@ def gpt4v_load_video(path: str, n_frames=5):
     return b64_frames
 
 
+@backoff.on_exception(
+    backoff.expo,
+    (
+        openai.ConflictError,
+        openai.APIStatusError,
+        openai.RateLimitError,
+        openai.APITimeoutError,
+        openai.APIConnectionError,
+        openai.InternalServerError,
+        openai.UnprocessableEntityError,
+        openai.APIResponseValidationError,
+    ),
+)
+def send_request(client: openai.Client, message, history):
+    messages = history + [{"role": "user", "content": message}]
+    response = client.chat.completions.create(
+        model="gpt-4-vision-preview", messages=messages, max_tokens=1200
+    )
+    reponse_text = response.choices[0].message.content
+
+    if reponse_text is None:
+        raise ValueError(f"Empty response from GPT-4. {messages=}, {response=}")
+
+    return reponse_text, [*messages, {"role": "assistant", "content": reponse_text}]
+
+
+def _frame_to_payload(image):
+    return {
+        "type": "image_url",
+        "image_url": {
+            "url": f"data:image/jpeg;base64,{image}",
+            "detail": "low",
+            "resize": 512,
+        },
+    }
+
+
 def gpt4(video_paths, descriptions, prompt):
     # Subsample the frames from the videos
     videos = [gpt4v_load_video(p) for p in video_paths]
+    dotenv.load_dotenv()
+    client = openai.OpenAI()  # API KEY should be loaded automatically by line above
 
     matrix = torch.zeros((len(videos), len(descriptions)))
 
     for i, video in enumerate(videos):
-        print("===========================")
+        log_path = Path(f"logs/gpt4/{i}")
+        log_path.mkdir(parents=True, exist_ok=True)
 
-        # save the frames as separate images
-        # for j, frame in enumerate(video):
-        #     with open(f"frames/{video_paths[i].split('/')[-1]}_{j}.jpg", "wb") as f:
-        #         f.write(base64.b64decode(frame))
+        video_name = video_paths[i].split("/")[-1]
+        for j, frame in enumerate(video):
+            with open(log_path / f"{video_name}_{j}.jpg", "wb") as f:
+                f.write(base64.b64decode(frame))
 
-        dotenv.load_dotenv()
-        client = openai.OpenAI()  # API KEY should be loaded automatically by line above
-        messages = [
-            {"role": "system", "content": [{"type": "text", "text": prompt}]},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "# TASK"},
-                    *[
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{f}",
-                                "detail": "low",
-                                "resize": 512,
-                            },
-                        }
-                        for f in video
-                    ],
-                ],
-            },
-        ]
-        response = client.chat.completions.create(
-            model="gpt-4-vision-preview", messages=messages, max_tokens=900
-        )
-        # Add response.choices[0].message.content to the messages list
-        messages.append(
-            {"role": "assistant", "content": response.choices[0].message.content}
-        )
-        print(response.choices[0].message.content)
-        messages.append(
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": 'Now, given this description, score the following potential video descriptions from 0 to 1 based on how well they fit the video/frames you\'ve seen. Feel free to use values between 0 and 1, too. Multiple labels can have the same score. The directions (e.g. "car turning left") are written from the POV of the driver of the car unless specified otherwise.\n\nFormat: \n- description: score\n\n'
-                        + "\n".join([f"- {d}" for d in set(descriptions)]),
-                    }
-                ],
-            }
-        )
-        response = client.chat.completions.create(
-            model="gpt-4-vision-preview", messages=messages, max_tokens=900
-        )
-        answer = response.choices[0].message.content
+        history = [{"role": "system", "content": [{"type": "text", "text": prompt}]}]
 
-        print(answer)
+        heading = {"type": "text", "text": "# TASK"}
+        frames = [_frame_to_payload(f) for f in video]
+        message = [heading, *frames]
 
-        # Parse out the scores which are in the format "- description: score"
+        _, history = send_request(client, message, history)
+
+        classes = "\n".join([f"- {d}" for d in set(descriptions)])
+        scoring_prompt = f"""
+Now, given the original frames and your description, score the following potential video descriptions from 0 to 1 based on how well they fit the frames you've seen. Feel free to use values between 0 and 1, too. Usually, there should be exactly one 'correct' description with score 1.
+
+{classes}
+
+Your answer format:
+- description: score
+"""
+
+        score_answer, history = send_request(client, scoring_prompt, history)
+
+        with open(log_path / "history.json", "w") as f:
+            json.dump(history, f, indent=2)
+
         scores = {
             m.group(1): float(m.group(2))
-            for m in re.finditer(r"- (.+): ([\d.]+)", answer)
+            for m in re.finditer(r"- (.+): ([\d.]+)", score_answer)
         }
 
         vals = []
         for d in descriptions:
-            if d in scores:
-                vals.append(scores[d])
-            else:
+            vals.append(scores.get(d, 1e-6))
+            if d not in scores:
                 print("WARNING: description not found in scores:", d)
                 print("Video:", video_paths[i])
-                vals.append(1e-6)
+                print(f"{history=}")
 
         matrix[i, :] = torch.Tensor([scores[d] for d in descriptions])
-
-        # with open("gpt4_scores.json", "w") as f:
-        #     json.dump(matrix.tolist(), f)
 
     return matrix.softmax(dim=1).cpu().numpy()
 
