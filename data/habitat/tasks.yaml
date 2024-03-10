@@ -1,4 +1,4 @@
-- name: room_detection
+- id: room_detection
   gpt4_prompt: |
     You will be given five frames from a video depicting a first-person video reconstruction taken in a 3D model of a house. Important notes:
     - the frames are given to you in chronological order
@@ -18,8 +18,8 @@
     4. We are still in the living room, heading towards the kitchen.
 
     # TASK
-  baseline_prompt: first-person indoor footage
-  label_prompts:
+  baseline: first-person indoor footage
+  labels:
     bathroom: first-person indoor footage in the bathroom
     bedroom: first-person indoor footage in the bedroom
     dining_room: first-person indoor footage in the dining room
@@ -34,7 +34,7 @@
     stairs: first-person indoor footage on the stairs
     unknown: first-person indoor footage in a room without a clear purpose
 
-- name: object_detection
+- id: object_detection
   gpt4_prompt: |
     You will be given five frames from a video depicting a first-person video reconstruction taken in a 3D model of a house. Important notes:
     - the frames are given to you in chronological order
@@ -53,8 +53,8 @@
     3. In this frame, we can see that the room seems to be adjacent to a kitchen.
     4. We are still in the living room, heading towards the kitchen.
 
-  baseline_prompt: first-person indoor footage
-  label_prompts:
+  baseline: first-person indoor footage
+  labels:
     tv: first-person footage in a room with a TV
     office_chair: first-person footage in a room with an office chair with wheels
     toilet: first-person footage in a room with a toilet

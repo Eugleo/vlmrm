@@ -7,8 +7,4 @@
 #SBATCH --job-name=vlmrm
 #SBATCH --output=logs/job_%j.log
 
-models=("gpt4")
-
-for model in "${models[@]}"; do
-    python src/evaluation/multiclass_evaluator.py -d data/habitat/data.csv -t data/habitat/tasks.yaml -m "$model" -r logit,projection -a 0.0,0.25,0.50,0.75,1.0 -n 32 -e gpt4_test
-done
+python src/evaluation/multiclass_evaluator.py -d data/habitat/data.csv -t data/habitat/tasks.yaml -m viclip,s3d,clip,gpt4 -r logit,projection -a 0.0,0.25,0.50,0.75,1.0 -n 32

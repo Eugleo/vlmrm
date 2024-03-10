@@ -14,22 +14,18 @@ from vlmrm.contrib.viclip import get_viclip
 
 class TextEncoder(Protocol):
     # TODO Add the shapes
-    def encode_text(self, x) -> torch.Tensor:
-        ...
+    def encode_text(self, x) -> torch.Tensor: ...
 
 
 class VideoEncoder(Protocol):
     # TODO Add the shapes
-    def encode_video(self, x: torch.Tensor) -> torch.Tensor:
-        ...
+    def encode_video(self, x: torch.Tensor) -> torch.Tensor: ...
 
     # TODO Add the shapes
-    def subsample(self, x: torch.Tensor) -> torch.Tensor:
-        ...
+    def subsample(self, x: torch.Tensor) -> torch.Tensor: ...
 
 
-class Encoder(TextEncoder, VideoEncoder, Protocol):
-    ...
+class Encoder(TextEncoder, VideoEncoder, Protocol): ...
 
 
 class CLIP(nn.Module):
@@ -155,7 +151,10 @@ class ViCLIP(nn.Module):
 
 class S3D(nn.Module):
     def __init__(
-        self, cache_dir: str, embedding_dim: int = 512, target_size: Tuple[int, int] = (224, 224)
+        self,
+        cache_dir: str,
+        embedding_dim: int = 512,
+        target_size: Tuple[int, int] = (224, 224),
     ) -> None:
         super().__init__()
         embedding_dim = 512
