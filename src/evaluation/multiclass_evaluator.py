@@ -62,6 +62,12 @@ def parse_args():
         help="Directory to save evaluation results.",
         default="out",
     )
+    parser.add_argument(
+        "--log-gpt-inputs",
+        help="Whether to log the frames that GPT4 gets",
+        action="store_true",
+        default=False,
+    )
 
     parser.add_argument("--cache-dir", default=".cache")
 
@@ -132,7 +138,9 @@ def _load_evaluators(args) -> list[Evaluator]:
             raise ValueError(f"Unknown model name {model_name}")
 
         if model_name == "gpt4":
-            rewards = [Reward("default", util.gpt4)]
+            rewards = [
+                Reward("default", partial(util.gpt4, log_inputs=args.log_gpt_inputs))
+            ]
         else:
             rewards = _load_rewards(args)
 

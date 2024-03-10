@@ -111,22 +111,25 @@ def _frame_to_payload(image):
 #     }
 
 
-def gpt4(frames_enc, labels, prompt):
+def gpt4(frames_enc, labels, prompt, log_inputs=False):
     dotenv.load_dotenv()
     client = openai.OpenAI()
 
     scores = torch.zeros((len(frames_enc), len(labels)))
 
-    log_path = Path(logging.getLogger().handlers[0].baseFilename).parent / "frames"
-    log_path.mkdir(parents=True, exist_ok=True)
+    logger_path = logging.getLogger().handlers[0].baseFilename  # type: ignore
+    log_path = Path(logger_path).parent / "frames"
+    if log_inputs:
+        log_path.mkdir(parents=True, exist_ok=True)
 
     for i, video in enumerate(frames_enc):
         logging.info(f"Starting GPT-4V evaluation for video {i + 1}/{len(frames_enc)}")
-        for j, frame in enumerate(video):
-            time = datetime.now().strftime("%Y%m%d_%H%M%S")
-            with open(log_path / f"{time}_v{i+1}_f{j}.jpg", "wb") as f:
-                logging.info(f"Writing frame {j} to {f.name}")
-                f.write(base64.b64decode(frame))
+        if log_inputs:
+            for j, frame in enumerate(video):
+                time = datetime.now().strftime("%Y%m%d_%H%M%S")
+                with open(log_path / f"{time}_v{i+1}_f{j}.jpg", "wb") as f:
+                    logging.info(f"Writing frame {j} to {f.name}")
+                    f.write(base64.b64decode(frame))
 
         logging.info(f"Using system prompt: {prompt}")
         history = [{"role": "system", "content": [{"type": "text", "text": prompt}]}]
