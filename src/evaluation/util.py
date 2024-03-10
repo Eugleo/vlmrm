@@ -1,4 +1,5 @@
 import base64
+import json
 import logging
 import re
 from datetime import datetime
@@ -123,11 +124,12 @@ def gpt4(frames_enc, labels, prompt, log_inputs=False):
         log_path.mkdir(parents=True, exist_ok=True)
 
     for i, video in enumerate(frames_enc):
+        time = datetime.now().strftime("%Y%m%d_%H%M%S")
+        video_dir = log_path / f"{time}_v{i+1}"
         logging.info(f"Starting GPT-4V evaluation for video {i + 1}/{len(frames_enc)}")
         if log_inputs:
             for j, frame in enumerate(video):
-                time = datetime.now().strftime("%Y%m%d_%H%M%S")
-                with open(log_path / f"{time}_v{i+1}_f{j}.jpg", "wb") as f:
+                with open(log_path / f"{time}_v{i+1}" / f"f{j}.jpg", "wb") as f:
                     logging.info(f"Writing frame {j} to {f.name}")
                     f.write(base64.b64decode(frame))
 
@@ -163,6 +165,10 @@ Your answer format:
                 print(f"{history=}")
 
         scores[i, :] = torch.Tensor([label_scores[d] for d in labels])
+
+        if log_inputs:
+            with open(video_dir / "history.json", "w") as f:
+                json.dump(history, f, indent=2)
 
     return scores.softmax(dim=1).cpu().numpy()
 
