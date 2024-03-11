@@ -1,46 +1,43 @@
 import argparse
 import base64
-import json
-import re
+import datetime
+import logging
+from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Callable, Tuple, Dict
+from typing import Callable, Dict
 
 import cv2
-import dotenv
-import numpy as np
-import openai
 import pandas as pd
 import torch
-from torch import Tensor
-from torch.amp.autocast_mode import autocast
+import yaml
 from einops import rearrange
-from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_score
-
 from evaluation import util
-import vlmrm.reward.rewards as rewards
+from torch import Tensor
+from torchvision.io import read_video
 from vlmrm.reward.encoders import CLIP, S3D, Encoder, ViCLIP
-from evaluation.evaluator import gpt4v_load_video, gpt4
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Run a set of zero-shot multiclass evaluations."
     )
     parser.add_argument(
-        "-t",
-        "--table-path",
+        "-d",
+        "--data",
         help="Path to a csv table containing video paths and their labels for each multiclass task.",
         required=True,
     )
     parser.add_argument(
-        "-d",
-        "--descriptions-for-class-labels",
-        help="Path to a csv table containing class descriptions for all tasks.",
+        "-t",
+        "--tasks",
+        help="Path to a yaml file containing task definitions (labels, prompts).",
         required=True,
     )
     parser.add_argument(
         "-m",
-        "--model",
-        help="Name of the model to evaluate (ViCLIP, S3D, CLIP)",
+        "--models",
+        help="Names of the models to evaluate (ViCLIP, S3D, CLIP, GPT4)",
         required=True,
     )
     parser.add_argument(
@@ -56,14 +53,8 @@ def parse_args():
     parser.add_argument(
         "-a",
         "--alphas",
-        help="If using projection reward, the value of alpha to use.",
+        help="If using projection reward, the values of alpha to use.",
         default=None,
-    )
-    parser.add_argument(
-        "-e",
-        "--experiment-id",
-        help="Name of current experiment (used to save the results)",
-        required=True,
     )
     parser.add_argument(
         "-o",
@@ -72,150 +63,103 @@ def parse_args():
         default="out",
     )
     parser.add_argument(
-        "--standardize",
-        help="Directory to save evaluation results.",
+        "--log-gpt-inputs",
+        help="Whether to log the frames that GPT4 gets",
+        action="store_true",
         default=False,
-        action="store_true",
     )
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--average-by-video",
-        action="store_true",
-        help="Use several videos of same action and average similarity"
-    )
-    parser.add_argument(
-        "--max-n-videos",
-        type=int,
-        default=10,
-        help="Max number of videos taken from each directory when `--average-by-video` is True"
-    )
+
     parser.add_argument("--cache-dir", default=".cache")
 
     args = parser.parse_args()
     return args
 
-def get_descriptions_and_baselines_for_tasks(label_descriptions: pd.DataFrame) -> Tuple[Dict[str, Dict[int, str]], Dict[str, str]]:
-    name2label2description: Dict[str, Dict[int, str]] = {}
-    name2baseline: Dict[str, str] = {}
 
-    for task_name, label_id, baseline_prompt, label_prompt in label_descriptions.itertuples(index=False):
-        if task_name not in name2label2description:
-            name2label2description[task_name] = {label_id: label_prompt}
-            name2baseline[task_name] = baseline_prompt
+@dataclass
+class Task:
+    id: str
+    gpt4_prompt: str
+    baseline_prompt: str
+    labels: Dict[str, str]
+
+    @staticmethod
+    def from_dict(val):
+        return Task(val["id"], val["gpt4_prompt"], val["baseline"], val["labels"])
+
+
+@dataclass
+class Reward:
+    id: str
+    _fun: Callable[..., Tensor]
+
+    def __call__(self, **kwargs):
+        return self._fun(**kwargs)
+
+
+@dataclass
+class Evaluator:
+    id: str
+    rewards: list[Reward]
+
+
+def _load_videos(paths: list[str]) -> list[Tensor]:
+    return [read_video(path, pts_unit="sec")[0] for path in paths]
+
+
+def _load_tasks(path) -> list[Task]:
+    with open(path) as f:
+        return [Task.from_dict(task) for task in yaml.safe_load(f)]
+
+
+def _load_rewards(args) -> list[Reward]:
+    rewards = []
+    for reward_name in args.rewards.split(","):
+        if reward_name == "logit":
+            rewards.append(Reward("logit", util.logit_reward))
+        elif reward_name == "projection":
+            if args.alphas is None:
+                raise ValueError("Alpha must be provided when using projection reward.")
+            for alpha in args.alphas.split(","):
+                rewards.append(
+                    Reward(
+                        f"projection_{alpha}",
+                        partial(util.projection_reward, alpha=float(alpha)),
+                    )
+                )
         else:
-            assert name2baseline[task_name] == baseline_prompt, \
-                f"Found differing baseline prompts within task {task_name}, {name2baseline[task_name]} and {baseline_prompt}"
-            
-            name2label2description[task_name][label_id] = label_prompt
+            raise ValueError(f"Unknown reward name {reward_name}")
+    return rewards
 
-    return name2label2description, name2baseline
 
-def compute_multiclass_metrics(average_similarities: torch.Tensor, true_labels: np.ndarray, verbose: bool) -> Dict[str, float]:
-    n_samples, n_classes = average_similarities.shape
-    predictions = np.argmax(average_similarities, axis=1)
+def _load_evaluators(args) -> list[Evaluator]:
+    evaluators = []
+    for model_name in args.models.split(","):
+        if model_name not in ["viclip", "s3d", "clip", "gpt4"]:
+            raise ValueError(f"Unknown model name {model_name}")
 
-    one_hot_true_labels = np.zeros((n_samples, n_classes))
-    one_hot_true_labels[range(n_samples), true_labels] = 1
+        if model_name == "gpt4":
+            rewards = [
+                Reward("default", partial(util.gpt4, log_inputs=args.log_gpt_inputs))
+            ]
+        else:
+            rewards = _load_rewards(args)
 
-    if verbose:
-        # note: when using prpjection reward, numbers are very large by modulo, seems like a bug
-        print("in compute_multiclass_metrics: average_similarities\n", average_similarities)
-        print("="*70)
+        logging.info(f"Loading evaluator {model_name} with rewards {rewards}")
+        evaluators.append(Evaluator(model_name, rewards))
 
-    # random performance will score 0 in adjusted_balanced_accuracy
-    return {
-        "accuracy": accuracy_score(true_labels, predictions),
-        "balanced_accuracy": balanced_accuracy_score(true_labels, predictions),
-        "adjusted_balanced_accuracy": balanced_accuracy_score(true_labels, predictions, adjusted=True),
-        "roc_auc_ovr_micro": roc_auc_score(one_hot_true_labels, average_similarities, multi_class="ovr", average="micro"),
-    }
+    return evaluators
 
-@autocast("cuda", enabled=torch.cuda.is_available())
-def main():
-    args = parse_args()
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+def _load_encoder(model_name: str, args, device: torch.device) -> Encoder:
+    assert model_name in ["viclip", "s3d", "clip"]
 
-    data = pd.read_csv(args.table_path)
-    label_descriptions = pd.read_csv(args.descriptions_for_class_labels)
+    logging.info(f"Loading encoder {model_name}")
 
-    task_name2label2description, task_name2baseline = get_descriptions_and_baselines_for_tasks(label_descriptions)
-
-# Getting videos
-    video_paths = []
-    video_group_borders = [0]
-
-    for dir_path in data["path"].values:
-        # Sorted to ensure deterministic results
-        video_paths_group = sorted(list(Path(dir_path).glob("*.avi")))
-        video_paths.extend(video_paths_group[:args.max_n_videos] if args.average_by_video else video_paths_group[:1])
-        video_group_borders.append(len(video_paths))
-
-    videos = util.get_video_batch(video_paths, device)
-    video_group_names = [Path(p).stem for p in data["path"]]
-
-# Setting up output directory
-    experiment_dir = Path(args.output_dir) / args.experiment_id
-    experiment_dir.mkdir(parents=True, exist_ok=True)
-    task_name2title2metrics = {}
-
-# Choosing model
-    if args.model.lower() == "gpt4":
-        print("="*70)
-        print("Warning: this was not debugged. Manually remove RuntimeError() if you are sure that you want to run this.")
-        print("="*70)
-        raise RuntimeError()
-
-        for task_name in task_name2baseline:
-            title = f"gpt4_{task_name}_{args.experiment_id}"
-
-            true_labels = data[task_name]
-            descriptions = [task_name2label2description[task_name][i]
-                for i in range(len(task_name2label2description[task_name]))]
-
-            reward_matrix = gpt4(video_paths, descriptions)
-            average_similarities, std_similarities = util.aggregate_similarities_many_video_groups(
-                reward_matrix,
-                prompt_group_borders=range(len(descriptions) + 1),
-                video_group_borders=video_group_borders,
-                do_normalize=args.standardize,
-            )
-
-            util.make_heatmap(
-                average_similarities,
-                groups=data["group"].to_list(),
-                trajectories_names=video_names,
-                labels=descriptions,
-                result_dir=str(experiment_dir),
-                experiment_id=title,
-            )
-
-            metrics = compute_multiclass_metrics(average_similarities, true_labels, args.verbose)
-
-            if task_name in task_name2title2metrics:
-                task_name2title2metrics[task_name][title] = metrics
-            else:
-                task_name2title2metrics[task_name] = {title: metrics}
-
-        with open(experiment_dir / "metrics.json", "w") as f:
-            json.dump(task_name2title2metrics, f, indent=2)
-
-        np.save(experiment_dir / "reward_matrix.npy", reward_matrix)
-        np.save(experiment_dir / "average_similarities.npy", average_similarities)
-        np.save(experiment_dir / "std_similarites.npy", std_similarites)
-
-        return
-
-    assert isinstance(args.model, str)
-    if args.model.lower() == "viclip":
+    if model_name == "viclip":
         encoder = ViCLIP(args.cache_dir)
-    elif args.model.lower() == "s3d":
+    elif model_name == "s3d":
         encoder = S3D(args.cache_dir)
-    elif args.model.lower() == "clip":
+    elif model_name == "clip":
         if args.n_frames is None:
             raise ValueError("Number of frames must be provided when using CLIP.")
         model = "ViT-bigG-14/laion2b_s39b_b160k"
@@ -226,70 +170,132 @@ def main():
             args.cache_dir,
             expected_n_frames=int(args.n_frames),
         )
-    encoder = encoder.to(device)
+    return encoder.to(device)
 
-# Parsing which reward functions we should try
-    task_name2named_reward_functions = {}
-    
-    for task_name in task_name2baseline:
-        task_name2named_reward_functions[task_name] = []
-            
-        for reward_name in args.rewards.split(","):
-            if reward_name == "logit":
-                task_name2named_reward_functions[task_name].append(
-                    (util.logit_reward, f"{args.model}_logit_{task_name}_{args.experiment_id}")
-                )
-            elif reward_name == "projection":
-                baselines = encoder.encode_text([task_name2baseline[task_name]] * len(data))
-                if args.alphas is None:
-                    raise ValueError("Alpha must be provided when using projection reward.")
-                for alpha in args.alphas.split(","):
-                    reward_fun = util.mk_projection_reward(float(alpha), baselines)
-                    title = f"{args.model}_projection_{alpha}_{task_name}_{args.experiment_id}"
-                    task_name2named_reward_functions[task_name].append((reward_fun, title))
-            else:
-                raise ValueError(f"Unknown reward name {reward_name}")
 
-# Running evaluations
-    for i, task_name in enumerate(task_name2named_reward_functions):
-        if args.verbose:
-            print(f"({i + 1}/{len(task_name2named_reward_functions)})  Task {task_name}")
+def _frames_to_encodings(frames: Tensor, encoder: Encoder) -> Tensor:
+    frames = rearrange(frames, "b f c h w -> f 1 b c h w")
+    logging.info(f"Encoding {frames.shape=} using {encoder.__class__.__name__}")
+    encodings = encoder.encode_video(frames)
+    logging.info(f"Encoding complete, {encodings.shape=}")
+    encodings = rearrange(encodings, "1 b d -> b d")
+    return encodings
 
-        true_labels = data[task_name]
-        descriptions = [task_name2label2description[task_name][i]
-            for i in range(len(task_name2label2description[task_name]))]
 
-        for j, (reward_fun, title) in enumerate(task_name2named_reward_functions[task_name]):
-            if args.verbose:
-                print(f"  ({j + 1}/{len(task_name2named_reward_functions[task_name])})   Evaluating {title}")
+def _frames_to_b64(frames: Tensor):
+    frames_np = frames.numpy()
+    # Convert RGB to BGR
+    frames_np = frames_np[:, :, :, ::-1]
 
-            reward_matrix = util.evaluate(encoder, videos, descriptions, reward_fun)
+    b64_frames = []
+    for frame in frames_np:
+        _, buffer = cv2.imencode(".jpg", frame)
+        b64_frames.append(base64.b64encode(buffer).decode("utf-8"))  # type: ignore
 
-            average_similarities, std_similarities = util.aggregate_similarities_many_video_groups(
-                reward_matrix,
-                prompt_group_borders=range(len(descriptions) + 1),
-                video_group_borders=video_group_borders,
-                do_normalize=args.standardize,
+    return b64_frames
+
+
+def main():
+    args = parse_args()
+    experiment_id = "Exp_{}".format(datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+    experiment_dir = Path(args.output_dir) / experiment_id
+    experiment_dir.mkdir(parents=True, exist_ok=True)
+
+    logging.basicConfig(
+        filename=experiment_dir / "experiment.log",
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+
+    logging.info(f"Starting experiment {experiment_id} with args {args}")
+
+    data = pd.read_csv(args.data)
+    logging.info(f"Loading {len(data)} videos from {args.data}")
+    video_paths = data["path"].to_list()
+    videos = _load_videos(video_paths)
+    tasks = _load_tasks(args.tasks)
+    # This doesn't load the models themselves, just the rewards and configs
+    evaluators = _load_evaluators(args)
+
+    # Put GPT first because it needs the videos to be on a CPU unlike the other models
+    evaluators = sorted(evaluators, key=lambda r: r.id != "gpt4")
+
+    results = []
+    # Loading the model is slow, so we do it only once, then score all tasks and rewards,
+    # and then free the memory before loading the next model
+    for evaluator in evaluators:
+        logging.info(f"Starting evaluation for model {evaluator.id}")
+
+        if evaluator.id == "gpt4":
+            # TODO: Make the number of frames to use for GPT4 a parameter
+            subsampled_videos = [util.subsample(video, frames=5) for video in videos]
+            # GPT needs the frames to be base64 encoded
+            frames_enc = [_frames_to_b64(video.cpu()) for video in subsampled_videos]
+        else:
+            # Using even the small models on CPU is very slow
+            device = torch.device("cuda:0")
+            # Hopefully it should be ok to call this in a loop
+            videos = [video.to(device) for video in videos]
+            encoder = _load_encoder(evaluator.id, args, device)
+            frames = torch.stack([encoder.subsample(video) for video in videos])
+            frames_enc = _frames_to_encodings(frames, encoder)
+
+        for task in tasks:
+            label_ids = list(task.labels.keys())
+            labels = list(task.labels.values())
+            logging.info(
+                f"Starting evaluation for task {task.id}, {label_ids=}, {labels=}"
             )
 
-            # util.make_heatmap(
-            #     average_similarities,
-            #     groups=data["group"].to_list(),
-            #     trajectories_names=video_group_names,
-            #     labels=descriptions,
-            #     result_dir=str(experiment_dir),
-            #     experiment_id=title,
-            # )
+            if evaluator.id != "gpt4":
+                assert isinstance(frames_enc, torch.Tensor)
+                device = frames_enc.device
 
-            metrics = compute_multiclass_metrics(average_similarities, true_labels, args.verbose)
+                labels_enc = encoder.encode_text(labels).to(device)
+                baselines_enc = encoder.encode_text(
+                    [task.baseline_prompt] * len(task.labels)
+                ).to(device)
+                logging.info(
+                    f"Encoded labels and baselines, {labels_enc.shape=}, {baselines_enc.shape=}"
+                )
 
-            if task_name in task_name2title2metrics:
-                task_name2title2metrics[task_name][title] = metrics
-            else:
-                task_name2title2metrics[task_name] = {title: metrics}
+            for reward in evaluator.rewards:
+                if evaluator.id == "gpt4":
+                    scores = reward(
+                        frames_enc=frames_enc,
+                        paths=video_paths,  # Only used for logging
+                        labels=labels,
+                        prompt=task.gpt4_prompt,
+                    )
+                else:
+                    scores = reward(
+                        frames_enc=frames_enc,
+                        labels_enc=labels_enc,
+                        baselines_enc=baselines_enc,
+                    )
 
-    with open(experiment_dir / "metrics.json", "w") as f:
-        json.dump(task_name2title2metrics, f, indent=2)
+                for video, true_label, row in zip(data["path"], data[task.id], scores):
+                    for label, score in zip(label_ids, row):
+                        results.append(
+                            {
+                                "video": video,
+                                "task": task.id,
+                                "model": evaluator.id,
+                                "reward": reward.id,
+                                "label": label,
+                                "probability": score,
+                                "true_probability": int(true_label == label),
+                            }
+                        )
+
+        # Free GPU memory since we are done with this model
+        if evaluator.id != "gpt4":
+            logging.info(f"Freeing memory for model {evaluator.id}")
+            del encoder
+            torch.cuda.empty_cache()
+
+    logging.info(f"Saving results to {experiment_dir / 'results.csv'}")
+    pd.DataFrame(results).to_csv(experiment_dir / "results.csv", index=False)
 
 
 if __name__ == "__main__":

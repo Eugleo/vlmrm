@@ -12,8 +12,8 @@ def projection_reward(
     direction = target - baseline
     projection = _compute_projection(direction, alpha)
 
-    x = x / torch.norm(x, dim=-1, keepdim=True)
-    y = 1 - (torch.norm((x - target) @ projection, dim=-1) ** 2) / 2
+    x_norm = x / torch.norm(x, dim=-1, keepdim=True)
+    y = 1 - (torch.norm((x_norm.unsqueeze(1) - target) @ projection, dim=-1) ** 2) / 2
 
     return y
 
