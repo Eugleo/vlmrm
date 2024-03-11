@@ -207,11 +207,12 @@ def main():
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
 
-    logging.info(f"Starting experiment {args.experiment_id} with args {args}")
+    logging.info(f"Starting experiment {experiment_id} with args {args}")
 
     data = pd.read_csv(args.data)
     logging.info(f"Loading {len(data)} videos from {args.data}")
-    videos = _load_videos(data["path"].to_list())
+    video_paths = data["path"].to_list()
+    videos = _load_videos(video_paths)
     tasks = _load_tasks(args.tasks)
     # This doesn't load the models themselves, just the rewards and configs
     evaluators = _load_evaluators(args)
@@ -262,6 +263,7 @@ def main():
                 if evaluator.id == "gpt4":
                     scores = reward(
                         frames_enc=frames_enc,
+                        paths=video_paths,  # Only used for logging
                         labels=labels,
                         prompt=task.gpt4_prompt,
                     )
@@ -287,7 +289,7 @@ def main():
                         )
 
         # Free GPU memory since we are done with this model
-        if encoder in locals():
+        if evaluator.id != "gpt4":
             logging.info(f"Freeing memory for model {evaluator.id}")
             del encoder
             torch.cuda.empty_cache()

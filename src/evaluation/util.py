@@ -112,24 +112,27 @@ def _frame_to_payload(image):
 #     }
 
 
-def gpt4(frames_enc, labels, prompt, log_inputs=False):
+def gpt4(frames_enc, paths, labels, prompt, log_inputs=False):
     dotenv.load_dotenv()
     client = openai.OpenAI()
 
     scores = torch.zeros((len(frames_enc), len(labels)))
 
     logger_path = logging.getLogger().handlers[0].baseFilename  # type: ignore
-    log_path = Path(logger_path).parent / "frames"
+    log_path = Path(logger_path).parent / "gpt4_logs"
     if log_inputs:
         log_path.mkdir(parents=True, exist_ok=True)
 
-    for i, video in enumerate(frames_enc):
+    for i, (path, video) in enumerate(zip(paths, frames_enc)):
         time = datetime.now().strftime("%Y%m%d_%H%M%S")
         video_dir = log_path / f"{time}_v{i+1}"
-        logging.info(f"Starting GPT-4V evaluation for video {i + 1}/{len(frames_enc)}")
+        logging.info(
+            f"Starting GPT-4V evaluation for video {i + 1}/{len(frames_enc)}, path: {path}"
+        )
         if log_inputs:
+            video_name = Path(path).stem
             for j, frame in enumerate(video):
-                with open(log_path / f"{time}_v{i+1}" / f"f{j}.jpg", "wb") as f:
+                with open(log_path / f"{time}_{video_name}" / f"f{j}.jpg", "wb") as f:
                     logging.info(f"Writing frame {j} to {f.name}")
                     f.write(base64.b64decode(frame))
 
