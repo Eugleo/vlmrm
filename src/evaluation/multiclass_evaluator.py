@@ -237,7 +237,15 @@ def main():
             # Hopefully it should be ok to call this in a loop
             videos = [video.to(device) for video in videos]
             encoder = _load_encoder(evaluator.id, args, device)
-            frames = torch.stack([encoder.subsample(video) for video in videos])
+            # TODO: We also call _transform inside encode_video, so we are doing it twice
+            # Check if this is okay
+            frames = []
+            for video in videos:
+                subsampled = encoder.subsample(video)
+                subsampled = rearrange(subsampled, "f h w c -> f c h w", c=3)
+                transformed = encoder._transform(subsampled)
+                frames.append(transformed)
+            frames = torch.stack(frames)
             frames_enc = _frames_to_encodings(frames, encoder)
 
         for task in tasks:
@@ -274,17 +282,20 @@ def main():
                         baselines_enc=baselines_enc,
                     )
 
-                for video, true_label, row in zip(data["path"], data[task.id], scores):
-                    for label, score in zip(label_ids, row):
+                for data_row, score_row in zip(data.to_dict(orient="records"), scores):
+                    for label, score in zip(label_ids, score_row):
+                        metadata = {
+                            k: v for k, v in data_row.items() if k not in [task.id]
+                        }
                         results.append(
                             {
-                                "video": video,
                                 "task": task.id,
                                 "model": evaluator.id,
                                 "reward": reward.id,
                                 "label": label,
                                 "probability": score,
-                                "true_probability": int(true_label == label),
+                                "true_probability": int(data_row[task.id] == label),
+                                **metadata,
                             }
                         )
 
@@ -292,6 +303,7 @@ def main():
         if evaluator.id != "gpt4":
             logging.info(f"Freeing memory for model {evaluator.id}")
             del encoder
+            del frames
             torch.cuda.empty_cache()
 
     logging.info(f"Saving results to {experiment_dir / 'results.csv'}")

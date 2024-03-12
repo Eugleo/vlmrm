@@ -18,6 +18,11 @@ class TextEncoder(Protocol):
 
 
 class VideoEncoder(Protocol):
+    # This should be a tensor of shape (b, c, h, w)
+    # Also, the transformation should be idempotent
+    # TODO: Check if this is true for the current models
+    def _transform(self, img: torch.Tensor) -> torch.Tensor: ...
+
     # TODO Add the shapes
     def encode_video(self, x: torch.Tensor) -> torch.Tensor: ...
 
@@ -75,7 +80,7 @@ class CLIP(nn.Module):
     def encode_video(self, x: torch.Tensor) -> torch.Tensor:
         if x.shape[3] != 3:
             x = x.permute(0, 1, 2, 5, 3, 4)
-        with torch.no_grad(), autocast("cuda", enabled=torch.cuda.is_available()):
+        with torch.no_grad():
             n_frames, n_windows, n_episodes, *_ = x.shape
             x = rearrange(x, "n_f n_w n_e c h w -> (n_f n_w n_e) c h w")
             # Embed every frame using CLIP
@@ -175,39 +180,39 @@ class S3D(nn.Module):
         x = x[::step, ...][: self.expected_n_frames, ...]
         return x
 
-    def _transform(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dtype not in (torch.float16, torch.float32, torch.float64):
-            x = x.float() / 255
-        x = F.interpolate(x, mode="bicubic", size=self.target_size)
-        x = x.clamp(0, 1)
-        return x
+    def _transform(self, img: torch.Tensor) -> torch.Tensor:
+        if img.dtype not in (torch.float16, torch.float32, torch.float64):
+            img = img.float() / 255
+        img = F.interpolate(img, mode="bicubic", size=self.target_size)
+        img = img.clamp(0, 1)
+        return img
 
     @torch.inference_mode()
     def encode_video(self, x: torch.Tensor) -> torch.Tensor:
         if x.shape[3] != 3:
             x = x.permute(0, 1, 2, 5, 3, 4)
-            n_frames, n_windows, n_episodes, *_ = x.shape
+        n_frames, n_windows, n_episodes, *_ = x.shape
 
-            assert n_frames >= self.expected_n_frames
+        assert n_frames >= self.expected_n_frames
 
-            # Take only n_frames frames, evenly spaced
-            x = self.subsample(x)
+        # Take only n_frames frames, evenly spaced
+        x = self.subsample(x)
 
-            x = rearrange(x, "n_f n_w n_e c h w -> (n_f n_w n_e) c h w")
-            x = self._transform(x)
-            x = rearrange(
-                x,
-                "(n_f n_w n_e) c h w -> (n_w n_e) c n_f h w",
-                n_f=self.expected_n_frames,
-                n_w=n_windows,
-                n_e=n_episodes,
-            )
+        x = rearrange(x, "n_f n_w n_e c h w -> (n_f n_w n_e) c h w")
+        x = self._transform(x)
+        x = rearrange(
+            x,
+            "(n_f n_w n_e) c h w -> (n_w n_e) c n_f h w",
+            n_f=self.expected_n_frames,
+            n_w=n_windows,
+            n_e=n_episodes,
+        )
 
-            # The episodes are the different samples in a batch
-            # The window, i.e. the frames, are the one video
-            window_embed = self._model(x)["video_embedding"]
-            window_embed = rearrange(
-                window_embed, "(n_w n_e) d -> n_w n_e d", n_w=n_windows, n_e=n_episodes
-            )
+        # The episodes are the different samples in a batch
+        # The window, i.e. the frames, are the one video
+        window_embed = self._model(x)["video_embedding"]
+        window_embed = rearrange(
+            window_embed, "(n_w n_e) d -> n_w n_e d", n_w=n_windows, n_e=n_episodes
+        )
 
         return window_embed
