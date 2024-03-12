@@ -23,16 +23,15 @@
     bathroom: first-person indoor footage in the bathroom
     bedroom: first-person indoor footage in the bedroom
     dining_room: first-person indoor footage in the dining room
-    dressing_room: first-person indoor footage in the dressing room
+    closet: first-person indoor footage in a closet
     garage: first-person indoor footage in the garage
     hall: first-person indoor footage in the hall
-    kids_room: first-person indoor footage in the kids room
     kitchen: first-person indoor footage in the kitchen
     laundry_room: first-person indoor footage in the laundry room
     living_room: first-person indoor footage in the living room
     office: first-person indoor footage in a home office
-    stairs: first-person indoor footage on the stairs
-    unknown: first-person indoor footage in a room without a clear purpose
+    stairs_up: first-person indoor footage of walking up the stairs
+    stairs_down: first-person indoor footage of walking down the stairs
 
 - id: object_detection
   gpt4_prompt: |
