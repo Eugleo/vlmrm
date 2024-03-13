@@ -43,7 +43,17 @@ def parse_args():
     parser.add_argument(
         "-n",
         "--n_frames",
-        help="How many frames to use for the video encoding. Only used in CLIP.",
+        help="How many frames to use for the video encoding. Only used in CLIP. -1 to use all frames.",
+    )
+    parser.add_argument(
+        "--window_size",
+        help="How many frames per window to use for the video encoding. Only used in CLIP.",
+        default=-1,  # all frames
+    )
+    parser.add_argument(
+        "--window_step",
+        help="How many frames should the (potentially overlapping) windows be separated by. Only used in CLIP.",
+        default=16,
     )
     parser.add_argument(
         "-r",
@@ -178,6 +188,11 @@ def _frames_to_encodings(frames: Tensor, encoder: Encoder) -> Tensor:
     logging.info(f"Encoding {frames.shape=} using {encoder.__class__.__name__}")
     encodings = encoder.encode_video(frames)
     logging.info(f"Encoding complete, {encodings.shape=}")
+    
+    # TODO remove
+    EVIL_HACK = True
+    if EVIL_HACK:
+        return rearrange(encodings, "b 1 d -> b d")
     encodings = rearrange(encodings, "1 b d -> b d")
     return encodings
 
@@ -237,8 +252,19 @@ def main():
             # Hopefully it should be ok to call this in a loop
             videos = [video.to(device) for video in videos]
             encoder = _load_encoder(evaluator.id, args, device)
+
             frames = torch.stack([encoder.subsample(video) for video in videos])
+            # print("shape of frames before unfold", frames.shape)
+            # if args.window_size != -1:
+            #     frames = rearrange(frames, "f b h w c -> f b c h w")
+            #     print('shape of frames after rearrange', frames.shape)
+            #     frames = frames.unfold(1, size=int(args.window_size), step=int(args.window_step))
+            #     print('shape of frames after unfold', frames.shape)
+            #     frames = rearrange(frames, "f b c h w s -> f b h w c s")
+            #     print('shape of frames after rearrange 2', frames.shape)
+            # print('unfold done')
             frames_enc = _frames_to_encodings(frames, encoder)
+            print("frames enc shape", frames_enc.shape)
 
         for task in tasks:
             label_ids = list(task.labels.keys())
@@ -273,9 +299,22 @@ def main():
                         labels_enc=labels_enc,
                         baselines_enc=baselines_enc,
                     )
+                    print("scores shape", scores.shape)  # TODO remove
 
-                for video, true_label, row in zip(data["path"], data[task.id], scores):
+                vts = zip(data["path"], data[task.id], scores)
+
+                EVIL_HACK = True
+                if EVIL_HACK:
+                    print("EVIL HACK")
+                    print("len data[path]", len(data["path"]))
+                    print("len data[task.id]", len(data[task.id]))
+                    print("len scores", len(scores))
+                    vts = zip([f"{data['path']} ; frame {i}" for i in range(len(scores))], [f"{data[task.id]} ; frame {i}" for i in range(len(scores))], scores)
+                
+                for video, true_label, row in vts:
+                    print("row.shape", row.shape)  # TODO remove
                     for label, score in zip(label_ids, row):
+                        print("score", score, "label", label, "true_label", true_label)  # TODO remove
                         results.append(
                             {
                                 "video": video,

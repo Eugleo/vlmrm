@@ -34,7 +34,7 @@ class CLIP(nn.Module):
         model_name: str,
         pretrained: str,
         cache_dir: str,
-        expected_n_frames: int = 32,
+        expected_n_frames: int = 32,  # -1 to use all frames
     ):
         super().__init__()
 
@@ -58,6 +58,7 @@ class CLIP(nn.Module):
         ).float()
         encoded = encoded / encoded.norm(dim=-1, keepdim=True)
         print(f"{encoded.shape=}")
+        print("for text", x)  # TODO remove
         return encoded
 
     @torch.inference_mode()
@@ -66,6 +67,8 @@ class CLIP(nn.Module):
         return encoded
 
     def subsample(self, x: torch.Tensor) -> torch.Tensor:
+        if self.expected_n_frames == -1:
+            return x
         n_frames, *_ = x.shape
         step = n_frames // self.expected_n_frames
         x = x[::step, ...][: self.expected_n_frames, ...]
@@ -73,14 +76,34 @@ class CLIP(nn.Module):
 
     @torch.inference_mode()
     def encode_video(self, x: torch.Tensor) -> torch.Tensor:
+        print('encoding video x shape', x.shape)  # TODO remove
         if x.shape[3] != 3:
             x = x.permute(0, 1, 2, 5, 3, 4)
         with torch.no_grad(), autocast("cuda", enabled=torch.cuda.is_available()):
             n_frames, n_windows, n_episodes, *_ = x.shape
+            print("n_frames", n_frames, "n_windows", n_windows, "n_episodes", n_episodes, "XXXXXXXXXXXXXXX")
             x = rearrange(x, "n_f n_w n_e c h w -> (n_f n_w n_e) c h w")
             # Embed every frame using CLIP
             x = self._transform(x)
             frame_embed = self._model.encode_image(x, normalize=True)
+            
+
+            # TODO put back: hack code to generate videos
+            EVIL_HACK = True
+            if EVIL_HACK:
+                print("EVIL HACK")
+                not_window_embed = reduce(
+                    frame_embed,
+                    "(n_f n_w n_e) d -> n_f n_e d",
+                    reduction="mean",
+                    n_f=n_frames,
+                    n_w=n_windows,
+                    n_e=n_episodes,
+                )
+                print("not_window_embed", not_window_embed.shape)
+                return not_window_embed
+            
+            
             # Calculate a per-window embedding by averaging all frame embeddings in the window
             window_embed = reduce(
                 frame_embed,
