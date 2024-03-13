@@ -8,12 +8,13 @@ from pathlib import Path
 from typing import Callable, Dict
 
 import cv2
-import pandas as pd
+import polars as pl
 import torch
 import yaml
 from einops import rearrange
 from evaluation import util
 from torch import Tensor
+from torch.utils.data import DataLoader, IterableDataset
 from torchvision.io import read_video
 from vlmrm.reward.encoders import CLIP, S3D, Encoder, ViCLIP
 
@@ -102,8 +103,27 @@ class Evaluator:
     rewards: list[Reward]
 
 
-def _load_videos(paths: list[str]) -> list[Tensor]:
-    return [read_video(path, pts_unit="sec")[0] for path in paths]
+class VideoDataset(IterableDataset):
+    def __init__(self, paths: list[str], device: torch.device, transforms=[]) -> None:
+        self.paths = paths
+        self.device = device
+        self.transforms = transforms
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __iter__(self):
+        for path in self.paths:
+            video = read_video(path, pts_unit="sec")[0].to(self.device)
+            for transform in self.transforms:
+                video = transform(video)
+            yield video
+
+    def __getitem__(self, idx: int) -> Tensor:
+        video = read_video(self.paths[idx], pts_unit="sec")[0].to(self.device)
+        for transform in self.transforms:
+            video = transform(video)
+        return video
 
 
 def _load_tasks(path) -> list[Task]:
@@ -209,11 +229,11 @@ def main():
 
     logging.info(f"Starting experiment {experiment_id} with args {args}")
 
-    data = pd.read_csv(args.data)
+    data = pl.read_csv(args.data)
     logging.info(f"Loading {len(data)} videos from {args.data}")
     video_paths = data["path"].to_list()
-    videos = _load_videos(video_paths)
     tasks = _load_tasks(args.tasks)
+    task_names = [task.id for task in tasks]
     # This doesn't load the models themselves, just the rewards and configs
     evaluators = _load_evaluators(args)
 
@@ -223,22 +243,30 @@ def main():
     results = []
     # Loading the model is slow, so we do it only once, then score all tasks and rewards,
     # and then free the memory before loading the next model
+
     for evaluator in evaluators:
         logging.info(f"Starting evaluation for model {evaluator.id}")
 
         if evaluator.id == "gpt4":
             # TODO: Make the number of frames to use for GPT4 a parameter
-            subsampled_videos = [util.subsample(video, frames=5) for video in videos]
-            # GPT needs the frames to be base64 encoded
-            frames_enc = [_frames_to_b64(video.cpu()) for video in subsampled_videos]
+            device = torch.device("cpu")
+            transforms = [partial(util.subsample, frames=5), _frames_to_b64]
+            frames_enc = list(VideoDataset(video_paths, device, transforms))
         else:
             # Using even the small models on CPU is very slow
             device = torch.device("cuda:0")
-            # Hopefully it should be ok to call this in a loop
-            videos = [video.to(device) for video in videos]
             encoder = _load_encoder(evaluator.id, args, device)
-            frames = torch.stack([encoder.subsample(video) for video in videos])
-            frames_enc = _frames_to_encodings(frames, encoder)
+            transforms = [
+                encoder.subsample,
+                partial(rearrange, pattern="f h w c -> f c h w", c=3),
+                encoder._transform,
+            ]
+            dataset = VideoDataset(video_paths, device, transforms)
+            dataloader = DataLoader(dataset, batch_size=8, shuffle=False)
+            framec_enc = []
+            for frames in dataloader:
+                framec_enc.append(_frames_to_encodings(frames, encoder))
+            frames_enc = torch.cat(framec_enc)
 
         for task in tasks:
             label_ids = list(task.labels.keys())
@@ -246,10 +274,14 @@ def main():
             logging.info(
                 f"Starting evaluation for task {task.id}, {label_ids=}, {labels=}"
             )
+            frame_mask = torch.Tensor(data[task.id].is_null().to_list())
 
             if evaluator.id != "gpt4":
                 assert isinstance(frames_enc, torch.Tensor)
                 device = frames_enc.device
+
+                frames_enc_masked = frames_enc[frame_mask == 0]
+                logging.info(f"Masked {frames_enc_masked.count_nonzero()} frames")
 
                 labels_enc = encoder.encode_text(labels).to(device)
                 baselines_enc = encoder.encode_text(
@@ -261,30 +293,46 @@ def main():
 
             for reward in evaluator.rewards:
                 if evaluator.id == "gpt4":
+                    # The objects below represent the task and the evaluator config
+                    # and are used to load and save the cache
+                    task_info = {
+                        "id": task.id,
+                        "gpt4_prompt": task.gpt4_prompt,
+                        "labels": labels,
+                    }
+                    eval_info = {"id": evaluator.id, "reward": reward.id, "n_frames": 5}
+                    cache = util.load_cache(args.cache_dir, task_info, eval_info)
                     scores = reward(
-                        frames_enc=frames_enc,
-                        paths=video_paths,  # Only used for logging
+                        frames_enc=[
+                            v for i, v in enumerate(frames_enc) if not frame_mask[i]
+                        ],
+                        paths=video_paths,  # Only used for logging and cache
+                        cache=cache,  # Is modified inside the function
                         labels=labels,
                         prompt=task.gpt4_prompt,
                     )
+                    util.save_cache(cache, args.cache_dir, task_info, eval_info)
                 else:
                     scores = reward(
-                        frames_enc=frames_enc,
+                        frames_enc=frames_enc_masked,
                         labels_enc=labels_enc,
                         baselines_enc=baselines_enc,
                     )
 
-                for video, true_label, row in zip(data["path"], data[task.id], scores):
-                    for label, score in zip(label_ids, row):
+                for data_row, score_row in zip(data.rows(named=True), scores):
+                    for label, score in zip(label_ids, score_row):
+                        metadata = {
+                            k: v for k, v in data_row.items() if k not in task_names
+                        }
                         results.append(
                             {
-                                "video": video,
                                 "task": task.id,
                                 "model": evaluator.id,
                                 "reward": reward.id,
                                 "label": label,
-                                "probability": score,
-                                "true_probability": int(true_label == label),
+                                "probability": score.item(),
+                                "true_probability": int(data_row[task.id] == label),
+                                **metadata,
                             }
                         )
 
@@ -295,7 +343,9 @@ def main():
             torch.cuda.empty_cache()
 
     logging.info(f"Saving results to {experiment_dir / 'results.csv'}")
-    pd.DataFrame(results).to_csv(experiment_dir / "results.csv", index=False)
+    pl.DataFrame(results, schema_overrides={"label": pl.String}).write_csv(
+        experiment_dir / "results.csv"
+    )
 
 
 if __name__ == "__main__":
