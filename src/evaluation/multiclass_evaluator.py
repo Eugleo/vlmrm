@@ -233,6 +233,7 @@ def main():
     logging.info(f"Loading {len(data)} videos from {args.data}")
     video_paths = data["path"].to_list()
     tasks = _load_tasks(args.tasks)
+    task_names = [task.id for task in tasks]
     # This doesn't load the models themselves, just the rewards and configs
     evaluators = _load_evaluators(args)
 
@@ -321,9 +322,7 @@ def main():
                 for data_row, score_row in zip(data.rows(named=True), scores):
                     for label, score in zip(label_ids, score_row):
                         metadata = {
-                            k: v
-                            for k, v in data_row.items()
-                            if k != task.id and v != pl.Null
+                            k: v for k, v in data_row.items() if k not in task_names
                         }
                         results.append(
                             {
@@ -344,7 +343,9 @@ def main():
             torch.cuda.empty_cache()
 
     logging.info(f"Saving results to {experiment_dir / 'results.csv'}")
-    pl.DataFrame(results).write_csv(experiment_dir / "results.csv")
+    pl.DataFrame(results, schema_overrides={"label": pl.String}).write_csv(
+        experiment_dir / "results.csv"
+    )
 
 
 if __name__ == "__main__":
