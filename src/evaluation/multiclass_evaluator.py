@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Callable, Dict
 
 import cv2
-import pandas as pd
+import polars as pl
 import torch
 import yaml
 from einops import rearrange
@@ -229,7 +229,7 @@ def main():
 
     logging.info(f"Starting experiment {experiment_id} with args {args}")
 
-    data = pd.read_csv(args.data)
+    data = pl.read_csv(args.data)
     logging.info(f"Loading {len(data)} videos from {args.data}")
     video_paths = data["path"].to_list()
     tasks = _load_tasks(args.tasks)
@@ -273,10 +273,14 @@ def main():
             logging.info(
                 f"Starting evaluation for task {task.id}, {label_ids=}, {labels=}"
             )
+            frame_mask = torch.Tensor(data[task.id].is_null().to_list())
 
             if evaluator.id != "gpt4":
                 assert isinstance(frames_enc, torch.Tensor)
                 device = frames_enc.device
+
+                frames_enc_masked = frames_enc[frame_mask == 0]
+                logging.info(f"Masked {frames_enc_masked.count_nonzero()} frames")
 
                 labels_enc = encoder.encode_text(labels).to(device)
                 baselines_enc = encoder.encode_text(
@@ -298,7 +302,9 @@ def main():
                     eval_info = {"id": evaluator.id, "reward": reward.id, "n_frames": 5}
                     cache = util.load_cache(args.cache_dir, task_info, eval_info)
                     scores = reward(
-                        frames_enc=frames_enc,
+                        frames_enc=[
+                            v for i, v in enumerate(frames_enc) if not frame_mask[i]
+                        ],
                         paths=video_paths,  # Only used for logging and cache
                         cache=cache,  # Is modified inside the function
                         labels=labels,
@@ -307,15 +313,17 @@ def main():
                     util.save_cache(cache, args.cache_dir, task_info, eval_info)
                 else:
                     scores = reward(
-                        frames_enc=frames_enc,
+                        frames_enc=frames_enc_masked,
                         labels_enc=labels_enc,
                         baselines_enc=baselines_enc,
                     )
 
-                for data_row, score_row in zip(data.to_dict(orient="records"), scores):
+                for data_row, score_row in zip(data.rows(named=True), scores):
                     for label, score in zip(label_ids, score_row):
                         metadata = {
-                            k: v for k, v in data_row.items() if k not in [task.id]
+                            k: v
+                            for k, v in data_row.items()
+                            if k != task.id and v != pl.Null
                         }
                         results.append(
                             {
@@ -336,7 +344,7 @@ def main():
             torch.cuda.empty_cache()
 
     logging.info(f"Saving results to {experiment_dir / 'results.csv'}")
-    pd.DataFrame(results).to_csv(experiment_dir / "results.csv", index=False)
+    pl.DataFrame(results).write_csv(experiment_dir / "results.csv")
 
 
 if __name__ == "__main__":
