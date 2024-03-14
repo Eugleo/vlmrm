@@ -7,4 +7,4 @@
 #SBATCH --job-name=vlmrm
 #SBATCH --output=logs/job_%j.log
 
-python src/evaluation/multiclass_evaluator.py -d data/habitat/data_video_visualize.csv -t data/habitat/tasks.yaml -m clip -r logit -n 360 --window_size=16 --window_step=1
+python src/evaluation/multiclass_evaluator.py -d data/habitat/data_video_visualize.csv -t data/habitat/tasks.yaml -m clip -r logit -n -1 --window_size=16 --window_step=1

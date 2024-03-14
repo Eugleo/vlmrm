@@ -253,6 +253,7 @@ def main():
             videos = [video.to(device) for video in videos]
             encoder = _load_encoder(evaluator.id, args, device)
 
+            print("len of each video", [len(video) for video in videos])
             frames = torch.stack([encoder.subsample(video) for video in videos])
             # print("shape of frames before unfold", frames.shape)
             # if args.window_size != -1:
